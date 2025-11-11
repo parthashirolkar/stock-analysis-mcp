@@ -132,12 +132,22 @@ async def stock_news(ticker: str, limit: int = 5) -> str:
             if item.get("published"):
                 try:
                     from datetime import datetime
+                    from dateutil import parser
 
-                    published_date = datetime.fromtimestamp(item["published"]).strftime(
-                        "%Y-%m-%d"
-                    )
-                except (ValueError, TypeError, OSError):
-                    published_date = "Unknown date"
+                    # Try to parse as ISO date string first
+                    if isinstance(item["published"], str):
+                        published_date = parser.parse(item["published"]).strftime("%Y-%m-%d")
+                    else:
+                        # Fallback to timestamp
+                        published_date = datetime.fromtimestamp(item["published"]).strftime("%Y-%m-%d")
+                except (ValueError, TypeError, OSError, ImportError):
+                    # Fallback: try simple string parsing
+                    try:
+                        # Extract just the date part from ISO string
+                        date_str = str(item["published"]).split("T")[0]
+                        published_date = date_str
+                    except (ValueError, IndexError, AttributeError):
+                        published_date = "Unknown date"
 
             result += f"""
 {i}. {item["title"]}
@@ -194,15 +204,30 @@ async def historical_data(ticker: str, period: str = "1M") -> str:
         if not data or not data.get("data"):
             return f"No historical data found for {ticker}"
 
-        result = f"Historical Data for {data['ticker']} ({data['period']}):\n\n"
+        total_data_points = len(data["data"])
 
-        # Show recent 10 data points
-        recent_data = data["data"][-10:]
-        result += "Date       | Open    | High    | Low     | Close   | Volume\n"
-        result += "-" * 65 + "\n"
+        if total_data_points <= 10:
+            result = f"Historical Data for {data['ticker']} ({data['period']}) - Last {total_data_points} data points:\n\n"
+            recent_data = data["data"]
+        else:
+            result = f"Historical Data for {data['ticker']} ({data['period']}) - Showing last 10 of {total_data_points} data points:\n\n"
+            recent_data = data["data"][-10:]
 
-        for item in recent_data:
-            result += f"{item['date']} | {item['open']:<7.2f} | {item['high']:<7.2f} | {item['low']:<7.2f} | {item['close']:<7.2f} | {item['volume']:,}\n"
+        # Convert to pandas DataFrame and use to_markdown()
+        try:
+            import pandas as pd
+            df = pd.DataFrame(recent_data)
+            # Set date as index for better display
+            df = df.set_index('date')
+            # Reorder columns to match OHLCV format
+            df = df[['open', 'high', 'low', 'close', 'volume']]
+            result += df.to_markdown(floatfmt='.2f')
+        except ImportError:
+            # Fallback to manual formatting if pandas is not available
+            result += "Date       | Open    | High    | Low     | Close   | Volume\n"
+            result += "-" * 65 + "\n"
+            for item in recent_data:
+                result += f"{item['date']} | {item['open']:<7.2f} | {item['high']:<7.2f} | {item['low']:<7.2f} | {item['close']:<7.2f} | {item['volume']:,}\n"
 
         # Calculate some basic stats
         closes = [item["close"] for item in data["data"]]

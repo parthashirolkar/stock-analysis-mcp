@@ -175,13 +175,17 @@ async def get_stock_news(ticker: str, limit: int = 5) -> List[Dict[str, Any]]:
             news = stock.news
             if news:
                 for item in news[:limit]:
+                    # Extract data from nested content structure
+                    content = item.get("content", {})
+                    provider = content.get("provider", {})
+
                     news_items.append(
                         {
-                            "title": item.get("title", ""),
-                            "url": item.get("link", ""),
-                            "publisher": item.get("publisher", ""),
-                            "published": item.get("providerPublishTime", ""),
-                            "summary": item.get("summary", ""),
+                            "title": content.get("title", "No title available"),
+                            "url": content.get("clickThroughUrl", {}).get("url", ""),
+                            "publisher": provider.get("displayName", "Unknown"),
+                            "published": content.get("pubDate", ""),
+                            "summary": content.get("summary", "No summary available"),
                         }
                     )
                 break
