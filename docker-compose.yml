@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  stock-analysis-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: indian-stock-mcp:latest
+    container_name: indian-stock-mcp-server
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=ERROR
+      - TZ=Asia/Kolkata
+    # Keep container running for exec access
+    entrypoint: ["tail", "-f", "/dev/null"]
+    # No ports exposed since using STDIO transport
+    # Health check for monitoring
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Resource limits for stability
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    # Custom labels for Docker Desktop
+    labels:
+      - "com.docker.compose.project=indian-stock-mcp"
+      - "description=Indian Stock Analysis MCP Server"
+      - "transport=stdio"
+
+# Optional: Add network configuration if needed
+networks:
+  default:
+    name: indian-stock-mcp-network
+    driver: bridge

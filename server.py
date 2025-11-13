@@ -7,7 +7,11 @@ for BSE/NSE listed stocks using FastMCP.
 """
 
 import logging
+import io
+import base64
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent
+from PIL import Image as PILImage
 
 # Import stock analysis functionality
 from stock_analyzer import (
@@ -18,6 +22,7 @@ from stock_analyzer import (
     get_historical_data,
     get_market_overview,
     get_market_status,
+    create_bollinger_chart,
     get_popular_stocks,
 )
 
@@ -306,6 +311,92 @@ async def popular_stocks_resource() -> str:
         return result.strip()
     except Exception as e:
         return f"Error fetching popular stocks: {str(e)}"
+
+
+def _encode_image(image) -> ImageContent:
+    """Encodes a PIL Image to a format compatible with ImageContent."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    img_bytes = buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode()
+
+    return ImageContent(
+        type="image",
+        data=img_base64,
+        mimeType="image/png"
+    )
+
+
+@mcp.tool()
+async def bollinger_bands(symbol: str, period: str = "3mo", interval: str = "1d") -> list:
+    """
+    Generate Bollinger Bands analysis with visual chart for an Indian stock.
+
+    Returns a comprehensive Bollinger Bands analysis including:
+    - Price chart with Bollinger Bands overlay
+    - Volatility analysis (Band Width)
+    - Current position analysis (overbought/oversold)
+    - Band squeeze detection
+    - Visual chart as MCP ImageContent
+
+    Args:
+        symbol: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
+        period: Time period for analysis ('1mo', '3mo', '6mo', '1y', '2y')
+        interval: Data interval ('1d' for daily, '1h' for hourly, '5m' for 5-minute)
+
+    Returns:
+        List containing text analysis and ImageContent with Bollinger Bands chart
+    """
+    try:
+        # Generate Bollinger Bands chart (returns PIL Image and analysis)
+        chart_image, analysis = create_bollinger_chart(symbol, period, interval)
+
+        # Format analysis text
+        analysis_text = f"""BOLLINGER BANDS ANALYSIS - {analysis['symbol']}
+
+📊 Price Information:
+• Current Price: Rs.{analysis['current_price']}
+• Price Range: Rs.{analysis['price_range']['min']} - Rs.{analysis['price_range']['max']}
+• Data Points: {analysis['data_points']} ({analysis['date_range']['start']} to {analysis['date_range']['end']})
+
+📈 Position Analysis:
+• Band Position: {analysis['position_percentage']}% ({analysis['position_status']})"""
+
+        if analysis['position_percentage'] > 75:
+            analysis_text += "\n⚠️ Stock is approaching OVERBOUGHT levels - Consider taking profits"
+        elif analysis['position_percentage'] < 25:
+            analysis_text += "\n✅ Stock is approaching OVERSOLD levels - Potential buying opportunity"
+        else:
+            analysis_text += "\n📊 Stock is in NEUTRAL territory"
+
+        analysis_text += f"""
+
+📉 Volatility Analysis:
+• Current Band Width: {analysis['current_band_width']}%
+• Average Band Width: {analysis['average_band_width']}%
+• Volatility Status: {analysis['volatility_status']}"""
+
+        if analysis['squeeze_detected']:
+            analysis_text += "\n🔔 BAND SQUEEZE DETECTED! Low volatility period - Major move likely coming soon"
+
+        analysis_text += f"""
+
+📋 Technical Summary:
+• Analysis Period: {analysis['period']} ({analysis['interval']})
+• Current Trend: {'UPWARD' if analysis['current_price'] > analysis['price_range']['min'] + (analysis['price_range']['max'] - analysis['price_range']['min']) * 0.5 else 'SIDEWAYS/DOWNWARD'}
+• Trading Range: {'WIDE' if analysis['current_band_width'] > analysis['average_band_width'] * 1.1 else 'NARROW'}"""
+
+        # Encode the PIL Image as MCP ImageContent
+        image_content = _encode_image(chart_image)
+
+        return [analysis_text.strip(), image_content]
+
+    except Exception as e:
+        # Create an error image instead of just returning text
+        error_image = PILImage.new("RGB", (600, 200), color="red")
+        error_content = _encode_image(error_image)
+
+        return [f"Error generating Bollinger Bands analysis: {str(e)}", error_content]
 
 
 def main():
