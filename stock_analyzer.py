@@ -7,8 +7,14 @@ Optimized for MCP server usage with FastMCP.
 
 import yfinance as yf
 import re
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from PIL import Image as PILImage
+import io
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 
 def normalize_ticker(ticker: str) -> Dict[str, str]:
@@ -473,3 +479,198 @@ async def get_popular_stocks() -> List[Dict[str, Any]]:
             "description": "Leading private sector bank",
         },
     ]
+
+
+def calculate_bollinger_bands(data: pd.DataFrame, window: int = 20, std_dev: float = 2) -> pd.DataFrame:
+    """
+    Calculate Bollinger Bands for stock data
+
+    Args:
+        data: DataFrame with OHLC data
+        window: Moving average window (default 20)
+        std_dev: Standard deviation multiplier (default 2)
+
+    Returns:
+        DataFrame with Bollinger Bands added
+    """
+    df = data.copy()
+
+    # Calculate SMA and Standard Deviation
+    df['SMA'] = df['Close'].rolling(window=window).mean()
+    df['SD'] = df['Close'].rolling(window=window).std()
+
+    # Calculate Upper and Lower Bands
+    df['Upper Band'] = df['SMA'] + (df['SD'] * std_dev)
+    df['Lower Band'] = df['SMA'] - (df['SD'] * std_dev)
+
+    # Calculate additional metrics
+    df['Band_Width'] = df['Upper Band'] - df['Lower Band']
+    df['Band_Width_Percent'] = (df['Band_Width'] / df['Close']) * 100
+    df['Band_Position'] = ((df['Close'] - df['Lower Band']) / (df['Upper Band'] - df['Lower Band'])) * 100
+
+    return df
+
+
+def create_bollinger_chart(symbol: str, period: str = "3mo", interval: str = "1d") -> Tuple[PILImage.Image, Dict[str, Any]]:
+    """
+    Generate Bollinger Bands chart for Indian stock
+
+    Args:
+        symbol: Stock ticker symbol
+        period: Time period (1mo, 3mo, 6mo, 1y, 2y)
+        interval: Data interval (1d, 1h, 5m)
+
+    Returns:
+        Tuple of (PIL Image, analysis_summary)
+    """
+    try:
+        # Set matplotlib style for better looking charts
+        plt.style.use('default')
+        plt.rcParams['figure.facecolor'] = 'white'
+        plt.rcParams['axes.facecolor'] = 'white'
+
+        # Get ticker variants for Yahoo Finance
+        ticker_variants = normalize_ticker(symbol)
+
+        # Try NSE first, then BSE
+        ticker_symbol = ticker_variants.get('yfinance_nse', ticker_variants.get('yfinance_bse', f'{symbol}.NS'))
+
+        # Fetch historical data
+        stock = yf.Ticker(ticker_symbol)
+        data = stock.history(period=period, interval=interval)
+
+        if data.empty:
+            raise ValueError(f"No data found for symbol {symbol}")
+
+        # Calculate Bollinger Bands
+        data = calculate_bollinger_bands(data)
+
+        # Create figure with subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={'height_ratios': [3, 1]})
+        fig.suptitle(f'{symbol.upper()} - Bollinger Bands Analysis', fontsize=16, fontweight='bold')
+
+        # Plot 1: Price and Bollinger Bands
+        # Plot the shaded area between bands first
+        ax1.fill_between(data.index, data['Upper Band'], data['Lower Band'],
+                        alpha=0.1, color='gray', label='Band Range')
+
+        # Plot the bands
+        ax1.plot(data.index, data['Upper Band'], 'r--', label='Upper Band', alpha=0.8, linewidth=1.5)
+        ax1.plot(data.index, data['Lower Band'], 'g--', label='Lower Band', alpha=0.8, linewidth=1.5)
+        ax1.plot(data.index, data['SMA'], 'b-', label='20-day SMA', alpha=0.9, linewidth=2)
+
+        # Plot the price
+        ax1.plot(data.index, data['Close'], 'k-', label='Close Price', linewidth=2.5)
+
+        # Highlight current position
+        current_price = data['Close'].iloc[-1]
+        current_position = data['Band_Position'].iloc[-1]
+        current_date = data.index[-1]
+
+        # Color based on position
+        if current_position > 75:
+            position_color = 'red'
+            position_status = 'Overbought'
+        elif current_position < 25:
+            position_color = 'green'
+            position_status = 'Oversold'
+        else:
+            position_color = 'blue'
+            position_status = 'Neutral'
+
+        # Mark current price
+        ax1.scatter(current_date, current_price, color=position_color, s=100, zorder=5,
+                   edgecolor='black', linewidth=2, label=f'Current ({position_status})')
+
+        # Add annotation for current position
+        ax1.annotate(f'Position: {current_position:.1f}%\nRs.{current_price:.2f}',
+                    xy=(current_date, current_price),
+                    xytext=(10, 10), textcoords='offset points',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor=position_color, alpha=0.7),
+                    fontsize=9, fontweight='bold', color='white')
+
+        # Formatting
+        ax1.set_ylabel('Price (Rs.)', fontsize=12)
+        ax1.legend(loc='upper left', fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_title('Price Action with Bollinger Bands', fontsize=14)
+
+        # Format x-axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+
+        # Plot 2: Band Width (Volatility)
+        ax2.fill_between(data.index, data['Band_Width_Percent'], alpha=0.3, color='orange')
+        ax2.plot(data.index, data['Band_Width_Percent'], color='darkorange', linewidth=2)
+        ax2.axhline(y=data['Band_Width_Percent'].mean(), color='red', linestyle='--',
+                   alpha=0.7, label=f'Average ({data["Band_Width_Percent"].mean():.1f}%)')
+
+        # Highlight squeeze zones (low volatility)
+        squeeze_threshold = data['Band_Width_Percent'].quantile(0.25)
+        ax2.fill_between(data.index, 0, squeeze_threshold, alpha=0.2, color='blue',
+                        label='Low Volatility Zone')
+
+        ax2.set_ylabel('Band Width (%)', fontsize=12)
+        ax2.set_xlabel('Date', fontsize=12)
+        ax2.set_title('Band Width (Volatility Indicator)', fontsize=12)
+        ax2.legend(loc='upper right', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+        # Adjust layout
+        plt.tight_layout()
+
+        # Convert matplotlib figure to PIL Image
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='png', dpi=150, bbox_inches='tight', facecolor='white')
+        buffer.seek(0)
+
+        # Create PIL Image from buffer
+        pil_image = PILImage.open(buffer)
+
+        # Clear the plot to free memory
+        plt.close(fig)
+
+        # Generate analysis summary
+        current_price = data['Close'].iloc[-1]
+        current_band_width = data['Band_Width_Percent'].iloc[-1]
+        avg_band_width = data['Band_Width_Percent'].mean()
+
+        # Volatility analysis
+        if current_band_width > avg_band_width * 1.2:
+            volatility_status = "HIGH (expanding bands)"
+        elif current_band_width < avg_band_width * 0.8:
+            volatility_status = "LOW (narrowing bands) - Watch for breakout!"
+        else:
+            volatility_status = "NORMAL"
+
+        # Check for band squeeze
+        recent_avg_width = data['Band_Width_Percent'].tail(10).mean()
+        squeeze_detected = recent_avg_width < squeeze_threshold
+
+        analysis = {
+            "symbol": symbol.upper(),
+            "current_price": round(current_price, 2),
+            "position_percentage": round(current_position, 1),
+            "position_status": position_status,
+            "current_band_width": round(current_band_width, 2),
+            "average_band_width": round(avg_band_width, 2),
+            "volatility_status": volatility_status,
+            "squeeze_detected": squeeze_detected,
+            "data_points": len(data),
+            "period": period,
+            "interval": interval,
+            "date_range": {
+                "start": data.index[0].strftime('%Y-%m-%d'),
+                "end": data.index[-1].strftime('%Y-%m-%d')
+            },
+            "price_range": {
+                "min": round(data['Close'].min(), 2),
+                "max": round(data['Close'].max(), 2)
+            }
+        }
+
+        return pil_image, analysis
+
+    except Exception as e:
+        raise ValueError(f"Failed to generate Bollinger Bands chart: {str(e)}")
