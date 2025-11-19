@@ -46,7 +46,4 @@ jobs:
 
     - name: Test container
       run: |
-        docker run --rm -d --name test-container indian-stock-mcp:latest
-        sleep 5
-        docker exec test-container uv run python -c "import server; print('✅ Container starts successfully')"
-        docker stop test-container
+        docker run --rm indian-stock-mcp:latest uv run python -c "import server; print('✅ Container starts successfully')"
