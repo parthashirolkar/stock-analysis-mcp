@@ -12,17 +12,19 @@ import base64
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
 from PIL import Image as PILImage
+import matplotlib
+
+matplotlib.use("Agg")  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 # Import stock analysis functionality
-from stock_analyzer import (
+from src.stock_analyzer import (
     get_stock_quote,
     get_company_fundamentals,
     get_stock_news,
     search_stocks,
-    get_historical_data,
     get_market_overview,
     get_market_status,
-    create_bollinger_chart,
     get_popular_stocks,
     get_technical_indicators,
     get_stock_actions,
@@ -204,62 +206,6 @@ async def search_indian_stocks(query: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
-async def historical_data(ticker: str, period: str = "1M") -> str:
-    """Get historical price data for technical analysis.
-
-    Args:
-        ticker: Indian stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
-        period: Time period for historical data (1D, 1W, 1M, 3M, 6M, 1Y, 2Y, 5Y)
-    """
-    try:
-        data = await get_historical_data(ticker, period)
-
-        if not data or not data.get("data"):
-            return f"No historical data found for {ticker}"
-
-        total_data_points = len(data["data"])
-
-        if total_data_points <= 10:
-            result = f"Historical Data for {data['ticker']} ({data['period']}) - Last {total_data_points} data points:\n\n"
-            recent_data = data["data"]
-        else:
-            result = f"Historical Data for {data['ticker']} ({data['period']}) - Showing last 10 of {total_data_points} data points:\n\n"
-            recent_data = data["data"][-10:]
-
-        # Convert to pandas DataFrame and use to_markdown()
-        try:
-            import pandas as pd
-
-            df = pd.DataFrame(recent_data)
-            # Set date as index for better display
-            df = df.set_index("date")
-            # Reorder columns to match OHLCV format
-            df = df[["open", "high", "low", "close", "volume"]]
-            result += df.to_markdown(floatfmt=".2f")
-        except ImportError:
-            # Fallback to manual formatting if pandas is not available
-            result += "Date       | Open    | High    | Low     | Close   | Volume\n"
-            result += "-" * 65 + "\n"
-            for item in recent_data:
-                result += f"{item['date']} | {item['open']:<7.2f} | {item['high']:<7.2f} | {item['low']:<7.2f} | {item['close']:<7.2f} | {item['volume']:,}\n"
-
-        # Calculate some basic stats
-        closes = [item["close"] for item in data["data"]]
-        if len(closes) > 1:
-            change = closes[-1] - closes[0]
-            change_pct = (change / closes[0]) * 100
-            result += f"\nPeriod Performance: {change_pct:+.2f}% (₹{change:+.2f})"
-            result += f"\nPeriod High: ₹{max(closes):.2f}"
-            result += f"\nPeriod Low: ₹{min(closes):.2f}"
-
-        result += f"\n\nLast Updated: {data['last_updated']}"
-
-        return result.strip()
-    except Exception as e:
-        return f"Error fetching historical data for {ticker}: {str(e)}"
-
-
-@mcp.tool()
 async def market_overview() -> str:
     """Get current Indian market indices and sector performance."""
     try:
@@ -330,82 +276,6 @@ def _encode_image(image) -> ImageContent:
     img_base64 = base64.b64encode(img_bytes).decode()
 
     return ImageContent(type="image", data=img_base64, mimeType="image/png")
-
-
-@mcp.tool()
-async def bollinger_bands(
-    symbol: str, period: str = "3mo", interval: str = "1d"
-) -> list:
-    """
-    Generate Bollinger Bands analysis with visual chart for an Indian stock.
-
-    Returns a comprehensive Bollinger Bands analysis including:
-    - Price chart with Bollinger Bands overlay
-    - Volatility analysis (Band Width)
-    - Current position analysis (overbought/oversold)
-    - Band squeeze detection
-    - Visual chart as MCP ImageContent
-
-    Args:
-        symbol: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
-        period: Time period for analysis ('1mo', '3mo', '6mo', '1y', '2y')
-        interval: Data interval ('1d' for daily, '1h' for hourly, '5m' for 5-minute)
-
-    Returns:
-        List containing text analysis and ImageContent with Bollinger Bands chart
-    """
-    try:
-        # Generate Bollinger Bands chart (returns PIL Image and analysis)
-        chart_image, analysis = create_bollinger_chart(symbol, period, interval)
-
-        # Format analysis text
-        analysis_text = f"""BOLLINGER BANDS ANALYSIS - {analysis["symbol"]}
-
-📊 Price Information:
-• Current Price: Rs.{analysis["current_price"]}
-• Price Range: Rs.{analysis["price_range"]["min"]} - Rs.{analysis["price_range"]["max"]}
-• Data Points: {analysis["data_points"]} ({analysis["date_range"]["start"]} to {analysis["date_range"]["end"]})
-
-📈 Position Analysis:
-• Band Position: {analysis["position_percentage"]}% ({analysis["position_status"]})"""
-
-        if analysis["position_percentage"] > 75:
-            analysis_text += (
-                "\n⚠️ Stock is approaching OVERBOUGHT levels - Consider taking profits"
-            )
-        elif analysis["position_percentage"] < 25:
-            analysis_text += "\n✅ Stock is approaching OVERSOLD levels - Potential buying opportunity"
-        else:
-            analysis_text += "\n📊 Stock is in NEUTRAL territory"
-
-        analysis_text += f"""
-
-📉 Volatility Analysis:
-• Current Band Width: {analysis["current_band_width"]}%
-• Average Band Width: {analysis["average_band_width"]}%
-• Volatility Status: {analysis["volatility_status"]}"""
-
-        if analysis["squeeze_detected"]:
-            analysis_text += "\n🔔 BAND SQUEEZE DETECTED! Low volatility period - Major move likely coming soon"
-
-        analysis_text += f"""
-
-📋 Technical Summary:
-• Analysis Period: {analysis["period"]} ({analysis["interval"]})
-• Current Trend: {"UPWARD" if analysis["current_price"] > analysis["price_range"]["min"] + (analysis["price_range"]["max"] - analysis["price_range"]["min"]) * 0.5 else "SIDEWAYS/DOWNWARD"}
-• Trading Range: {"WIDE" if analysis["current_band_width"] > analysis["average_band_width"] * 1.1 else "NARROW"}"""
-
-        # Encode the PIL Image as MCP ImageContent
-        image_content = _encode_image(chart_image)
-
-        return [analysis_text.strip(), image_content]
-
-    except Exception as e:
-        # Create an error image instead of just returning text
-        error_image = PILImage.new("RGB", (600, 200), color="red")
-        error_content = _encode_image(error_image)
-
-        return [f"Error generating Bollinger Bands analysis: {str(e)}", error_content]
 
 
 @mcp.tool()
@@ -732,6 +602,165 @@ Current Price: ₹{data["current_price"]:.2f}
 
 
 @mcp.tool()
+async def train_arima_model(
+    ticker: str,
+    p: int = 1,
+    d: int = 1,
+    q: int = 1,
+    validation_split: float = 0.2,
+    auto_select: bool = True,
+    lags: int = 40,
+    period: str = "1y",
+) -> list:
+    """
+    Train ARIMA model with intelligent parameter selection using existing ACF/PACF analysis.
+
+    Provides:
+    - Model training with automated ARIMA order selection
+    - Intelligent parameter suggestions from ACF/PACF analysis
+    - Performance metrics and validation on holdout set
+    - Model persistence with caching capability
+    - Error handling and graceful fallbacks
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
+        p: AR order (None for auto-selection)
+        d: Differencing order (default 1 for stock prices)
+        q: MA order (None for auto-selection)
+        validation_split: Train-validation split ratio (default 0.2)
+        auto_select: Use ACF/PACF analysis for parameter selection
+        lags: Number of lags for analysis (default 40)
+        period: Time period for training data ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+
+    Returns:
+        List containing text analysis and ImageContent with training plot
+    """
+    try:
+        from src.model_training import ARIMATrainer
+
+        # Initialize trainer
+        trainer = ARIMATrainer(ticker, period)
+
+        # Let train_model handle everything including data loading and auto-selection
+        result = trainer.train_model(
+            p=p if not auto_select else None,
+            d=d,
+            q=q if not auto_select else None,
+            validation_split=validation_split,
+            auto_select=auto_select,
+        )
+
+        try:
+            # Create training plot
+            buf = io.BytesIO()
+            plt.figure(figsize=(14, 8))
+
+            # Get train/test split for visualization
+            split_point = int(len(trainer.data) * (1 - validation_split))
+            train_data_plot = trainer.data.iloc[:split_point]
+            test_data_plot = trainer.data.iloc[split_point:]
+
+            # Plot training data
+            plt.plot(
+                train_data_plot.index,
+                train_data_plot.values,
+                label="Training Data",
+                alpha=0.7,
+                color="blue",
+            )
+
+            # Plot ARIMA fit (only for training period)
+            plt.plot(
+                train_data_plot.index,
+                result["model"].fittedvalues,
+                label="ARIMA Fit",
+                alpha=0.9,
+                linewidth=2,
+                color="orange",
+            )
+
+            # Plot test data
+            plt.plot(
+                test_data_plot.index,
+                test_data_plot.values,
+                label="Test Data",
+                alpha=0.7,
+                color="green",
+                linestyle="--",
+            )
+
+            plt.title(
+                f"ARIMA Model Training - {ticker.upper()} (p={result['parameters']['p']},d={result['parameters']['d']},q={result['parameters']['q']})"
+            )
+            plt.xlabel("Date")
+            plt.ylabel("Price")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            img_bytes = buf.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode()
+            training_plot = ImageContent(
+                type="image", data=img_base64, mimeType="image/png"
+            )
+            buf.close()
+            plt.close()
+
+            # Format comprehensive analysis result
+            performance = result["performance"]
+            model_info = result["parameters"]
+
+            result_text = f"""🤖 ARIMA MODEL TRAINING - {ticker.upper()}
+
+📊 TRAINING SUMMARY:
+• Ticker: {ticker}
+• Training Data Points: {performance["train_size"]}
+• Validation Data Points: {performance["test_size"]}
+• Training Split: {(1 - performance["validation_split"]) * 100:.0f}% train / {performance["validation_split"] * 100:.0f}% test
+• Model Orders: ARIMA({model_info["p"]},{model_info["d"]},{model_info["q"]})
+
+📈 MODEL PERFORMANCE METRICS:
+• AIC: {result["aic"]:.4f}
+• BIC: {result["bic"]:.4f}
+• Log-Likelihood: {result["log_likelihood"]:.2f}
+• Model Converged: {"✅ Yes" if result["converged"] else "❌ No"}
+
+📊 VALIDATION METRICS (Test Set):
+• Mean Squared Error (MSE): {performance["mse"]:.6f}
+• Mean Absolute Error (MAE): {performance["mae"]:.4f}
+• Mean Absolute Percentage Error (MAPE): {performance["mape"]:.2f}%
+
+💡 MODEL INSIGHTS:
+• Parameter Selection: {"Automatic" if auto_select else "Manual"}
+• Next Steps: Use 'forecast_arima_model' for predictions, 'arima_model_diagnostics' for validation
+• Alternative: Try different (p,d,q) combinations if performance unsatisfactory
+
+📈 TRAINING VISUALIZATION:
+• Historical data with fitted ARIMA model overlay
+• Model fit diagnostics displayed
+• Professional chart with training/validation split visualization
+            """.strip()
+
+            return [result_text.strip(), training_plot]
+
+        except Exception as e:
+            # Create error visualization
+            error_image = PILImage.new("RGB", (600, 200), color="red")
+            error_content = _encode_image(error_image)
+
+            return [f"❌ ARIMA training failed for {ticker}: {str(e)}", error_content]
+
+    except Exception as e:
+        # Create error visualization
+        error_image = PILImage.new("RGB", (600, 200), color="red")
+        error_content = _encode_image(error_image)
+
+        return [f"Error training ARIMA model for {ticker}: {str(e)}", error_content]
+
+
+@mcp.tool()
 async def stock_holders(ticker: str) -> str:
     """Get major holders and institutional ownership information for an Indian stock.
 
@@ -834,6 +863,484 @@ Market Cap: ₹{data["market_cap"]:,}
 
     except Exception as e:
         return f"Error fetching stock holders data for {ticker}: {str(e)}"
+
+
+@mcp.tool()
+async def arima_model_diagnostics(ticker: str, period: str = "1y") -> list:
+    """
+    Perform comprehensive diagnostics on trained ARIMA model.
+
+    Provides:
+    - Residual analysis with ACF/PACF plots
+    - Normality tests and QQ plots
+    - Ljung-Box test for autocorrelation
+    - Model adequacy checks and recommendations
+    - Visual diagnostic charts
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
+        period: Time period for analysis ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+
+    Returns:
+        List containing text analysis and ImageContent with diagnostic plots
+    """
+    try:
+        from src.model_training import ARIMATrainer
+
+        # Initialize trainer
+        trainer = ARIMATrainer(ticker, period)
+
+        # Train model first before diagnostics
+        try:
+            trainer.train_model(
+                p=None, d=1, q=None, validation_split=0.8, auto_select=True
+            )
+        except Exception as e:
+            # Create error visualization
+            error_image = PILImage.new("RGB", (600, 200), color="red")
+            error_content = _encode_image(error_image)
+            return [
+                f"❌ Failed to train ARIMA model for {ticker}: {str(e)}",
+                error_content,
+            ]
+
+        # Perform diagnostics
+        try:
+            diagnostic_result = trainer.comprehensive_diagnostics()
+
+            # Create diagnostic visualization
+            buf = io.BytesIO()
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            fig.suptitle(f"ARIMA Model Diagnostics - {ticker.upper()}", fontsize=16)
+
+            # Residuals Time Series
+            axes[0, 0].plot(diagnostic_result["dates"], diagnostic_result["residuals"])
+            axes[0, 0].axhline(y=0, color="r", linestyle="--")
+            axes[0, 0].set_title("Residuals Over Time")
+            axes[0, 0].set_xlabel("Date")
+            axes[0, 0].set_ylabel("Residuals")
+            axes[0, 0].grid(True, alpha=0.3)
+
+            # Residual ACF
+            axes[0, 1].stem(
+                diagnostic_result["residual_acf"]["lags"][:20],
+                diagnostic_result["residual_acf"]["acf_values"][:20],
+                basefmt=" ",
+            )
+            axes[0, 1].axhline(y=0, color="black", linewidth=0.5)
+            axes[0, 1].axhline(
+                y=diagnostic_result["residual_acf"]["confidence_interval"],
+                color="red",
+                linestyle="--",
+                alpha=0.5,
+            )
+            axes[0, 1].axhline(
+                y=-diagnostic_result["residual_acf"]["confidence_interval"],
+                color="red",
+                linestyle="--",
+                alpha=0.5,
+            )
+            axes[0, 1].set_title("Residual Autocorrelation")
+            axes[0, 1].set_xlabel("Lag")
+            axes[0, 1].set_ylabel("ACF")
+            axes[0, 1].grid(True, alpha=0.3)
+
+            # QQ Plot
+            import scipy.stats as stats
+
+            stats.probplot(diagnostic_result["residuals"], dist="norm", plot=axes[1, 0])
+            axes[1, 0].set_title("Normality QQ Plot")
+            axes[1, 0].grid(True, alpha=0.3)
+
+            # Residual Histogram
+            axes[1, 1].hist(
+                diagnostic_result["residuals"], bins=30, alpha=0.7, density=True
+            )
+            axes[1, 1].set_title("Residual Distribution")
+            axes[1, 1].set_xlabel("Residuals")
+            axes[1, 1].set_ylabel("Density")
+            axes[1, 1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            img_bytes = buf.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode()
+            diagnostic_plot = ImageContent(
+                type="image", data=img_base64, mimeType="image/png"
+            )
+            buf.close()
+            plt.close()
+
+            # Format comprehensive diagnostic result
+            diagnostics = diagnostic_result["diagnostics"]
+            normality = diagnostic_result["normality_tests"]
+            ljung_box = diagnostic_result["ljung_box_test"]
+            recommendations = diagnostic_result["recommendations"]
+
+            result_text = f"""🔍 ARIMA MODEL DIAGNOSTICS - {ticker.upper()}
+
+📊 MODEL OVERVIEW:
+• Ticker: {ticker}
+• Data Points: {diagnostic_result["data_points"]}
+• Model Orders: ARIMA({diagnostic_result["model_info"]["p"]},{diagnostic_result["model_info"]["d"]},{diagnostic_result["model_info"]["q"]})
+• Analysis Period: {diagnostic_result["date_range"]["start"]} to {diagnostic_result["date_range"]["end"]}
+
+📈 RESIDUAL ANALYSIS:
+• Mean Residual: {diagnostics["mean_residual"]:.6f}
+• Std Deviation: {diagnostics["std_residual"]:.6f}
+• Min Residual: {diagnostics["min_residual"]:.6f}
+• Max Residual: {diagnostics["max_residual"]:.6f}
+• Residual Sum: {diagnostics["residual_sum"]:.6f}
+
+🔬 NORMALITY TESTS:"""
+
+            for test_name, test_result in normality.items():
+                result_text += f"\n• {test_name}:"
+                result_text += f"\n  - Statistic: {test_result['statistic']:.4f}"
+                result_text += f"\n  - P-Value: {test_result['p_value']:.4f}"
+                result_text += f"\n  - Result: {test_result['result']}"
+
+            result_text += f"""
+
+📊 LJUNG-BOX TEST:
+• Test Statistic: {ljung_box["statistic"]:.4f}
+• P-Value: {ljung_box["p_value"]:.4f}
+• Lags Used: {ljung_box["lags"]}
+• Result: {ljung_box["result"]}
+
+✅ MODEL ADEQUACY:
+• Overall Assessment: {recommendations["overall_assessment"]}
+• White Noise: {recommendations["white_noise_conclusion"]}
+• Autocorrelation: {recommendations["autocorrelation_conclusion"]}
+• Normality: {recommendations["normality_conclusion"]}"""
+
+            if recommendations["significant_residual_lags"]:
+                result_text += f"\n• Significant Residual Lags: {recommendations['significant_residual_lags']}"
+
+            result_text += """
+
+💡 MODEL RECOMMENDATIONS:"""
+
+            if recommendations["model_improvements"]:
+                result_text += "\n🔧 Suggested Improvements:"
+                for improvement in recommendations["model_improvements"]:
+                    result_text += f"\n  • {improvement}"
+            else:
+                result_text += "\n✅ No major improvements needed"
+
+            if recommendations["parameter_suggestions"]:
+                result_text += "\n⚙️ Parameter Suggestions:"
+                for suggestion in recommendations["parameter_suggestions"]:
+                    result_text += f"\n  • {suggestion}"
+
+            result_text += f"""
+
+📋 QUALITY INDICATORS:
+• Model Fit Quality: {recommendations["model_quality"]}
+• Forecast Reliability: {recommendations["forecast_reliability"]}
+• Complexity Level: {recommendations["complexity_level"]}
+• Risk Assessment: {recommendations["risk_assessment"]}
+
+⚠️ LIMITATIONS & WARNINGS:"""
+
+            if recommendations["warnings"]:
+                for warning in recommendations["warnings"]:
+                    result_text += f"\n• {warning}"
+            else:
+                result_text += "\n• No major concerns identified"
+
+            result_text += """
+
+🔍 DIAGNOSTIC VISUALIZATION:
+• Residuals time series plot for pattern detection
+• Autocorrelation function for independence check
+• QQ plot for normality assessment
+• Histogram for distribution analysis
+• Professional statistical diagnostic suite
+
+💡 NEXT STEPS:
+• Use 'forecast_arima_model' for predictions if diagnostics are favorable
+• Consider retraining with different parameters if issues detected
+• Monitor forecast accuracy and model performance over time
+• Complement with fundamental analysis for investment decisions
+            """.strip()
+
+            return [result_text.strip(), diagnostic_plot]
+
+        except Exception as e:
+            # Create error visualization
+            error_image = PILImage.new("RGB", (600, 200), color="red")
+            error_content = _encode_image(error_image)
+
+            return [
+                f"❌ ARIMA diagnostics failed for {ticker}: {str(e)}",
+                error_content,
+            ]
+
+    except Exception as e:
+        # Create error visualization
+        error_image = PILImage.new("RGB", (600, 200), color="red")
+        error_content = _encode_image(error_image)
+
+        return [
+            f"Error generating ARIMA diagnostics for {ticker}: {str(e)}",
+            error_content,
+        ]
+
+
+@mcp.tool()
+async def forecast_arima_model(
+    ticker: str,
+    periods: int = 20,
+    confidence: float = 0.95,
+    p: int = 1,
+    d: int = 1,
+    q: int = 1,
+    auto_select: bool = True,
+    lags: int = 40,
+    period: str = "1y",
+) -> list:
+    """
+    Generate ARIMA model forecasts with confidence intervals and validation.
+
+    Provides:
+    - Multi-period forecasting with confidence bands
+    - Model validation and quality checks
+    - Visual forecast charts with historical data
+    - Performance metrics and accuracy indicators
+    - Error handling with fallback strategies
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
+        periods: Number of periods to forecast (default: 20 trading days)
+        confidence: Confidence interval level (0.8-0.99, default: 0.95)
+        p: AR order (None for auto-selection)
+        d: Differencing order (default 1 for stock prices)
+        q: MA order (None for auto-selection)
+        auto_select: Use ACF/PACF analysis for parameter selection
+        lags: Number of lags for analysis (default 40)
+        period: Time period for training data ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+
+    Returns:
+        List containing text analysis and ImageContent with forecast plot
+    """
+    try:
+        from src.model_training import ARIMATrainer
+
+        # Validate inputs
+        if periods < 1 or periods > 252:  # Max one year of trading days
+            raise ValueError(f"Periods must be between 1 and 252, got {periods}")
+        if not 0.8 <= confidence <= 0.99:
+            raise ValueError(
+                f"Confidence must be between 0.8 and 0.99, got {confidence}"
+            )
+
+        # Initialize trainer
+        trainer = ARIMATrainer(ticker, period)
+
+        # Check if model exists in cache
+        model_key = f"{ticker}_{period}_{p}_{d}_{q}"
+        cached_model = trainer.get_cached_model(model_key)
+
+        if not cached_model:
+            # Parameter selection strategy
+            if auto_select:
+                suggestions = trainer.integrate_acf_pacf_suggestions(max_lags=lags)
+                p = suggestions["recommended_ar"] or 1
+                q = suggestions["recommended_ma"] or 1
+            # else: use provided p and q values (already have defaults of 1)
+
+            # Validate parameters
+            max_lags = len(trainer.data) - 2
+            if p >= len(trainer.data) or q >= len(trainer.data) or (p + q) >= max_lags:
+                raise ValueError(f"Parameters (p={p}, q={q}) exceed data constraints")
+
+            # Train model
+            train_result = trainer.train_model(p, d, q, validation_split=0.8)
+            model = train_result["model"]
+        else:
+            model = cached_model["model"]
+
+        try:
+            # Generate forecasts
+            forecast_result = trainer.forecast_model(model, periods, confidence)
+
+            # Create forecast visualization
+            buf = io.BytesIO()
+            plt.figure(figsize=(14, 8))
+
+            # Historical data
+            plt.plot(
+                trainer.data.index[-60:],
+                trainer.data.values[-60:],
+                label="Historical Data",
+                alpha=0.7,
+                linewidth=2,
+            )
+
+            # Forecast
+            forecast_dates = forecast_result["forecast_dates"]
+            forecast_mean = forecast_result["forecast_mean"]
+            forecast_ci_lower = forecast_result["forecast_ci_lower"]
+            forecast_ci_upper = forecast_result["forecast_ci_upper"]
+
+            # Convert Series to list for plotting compatibility
+            forecast_mean_list = (
+                forecast_mean.tolist()
+                if hasattr(forecast_mean, "tolist")
+                else list(forecast_mean)
+            )
+
+            plt.plot(
+                forecast_dates,
+                forecast_mean_list,
+                label="Forecast",
+                color="red",
+                linewidth=2,
+                marker="o",
+            )
+            plt.fill_between(
+                forecast_dates,
+                forecast_ci_lower,
+                forecast_ci_upper,
+                alpha=0.3,
+                color="red",
+                label=f"{int(confidence * 100)}% Confidence Band",
+            )
+
+            # Last known price line
+            last_price = float(trainer.data.iloc[-1])
+            plt.axhline(
+                y=last_price,
+                color="green",
+                linestyle="--",
+                alpha=0.7,
+                label=f"Last Price: ₹{last_price:.2f}",
+            )
+
+            plt.title(f"ARIMA Forecast - {ticker.upper()} ({periods} periods)")
+            plt.xlabel("Date")
+            plt.ylabel("Price")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            img_bytes = buf.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode()
+            forecast_plot = ImageContent(
+                type="image", data=img_base64, mimeType="image/png"
+            )
+            buf.close()
+            plt.close()
+
+            # Format comprehensive analysis result
+            forecast_analysis = forecast_result["analysis"]
+            performance = forecast_result["performance"]
+
+            result_text = f"""🔮 ARIMA FORECAST - {ticker.upper()}
+
+📊 FORECAST SUMMARY:
+• Ticker: {ticker}
+• Forecast Periods: {periods} trading days
+• Confidence Level: {confidence * 100:.0f}%
+• Last Price: ₹{forecast_analysis["last_price"]:.2f}
+• Forecast Horizon: {forecast_analysis["forecast_start_date"]} to {forecast_analysis["forecast_end_date"]}
+
+📈 FORECAST RESULTS:
+• Final Forecast: ₹{forecast_analysis["final_forecast"]:.2f}
+• Price Change: {forecast_analysis["price_change"]:+.2f} ({forecast_analysis["price_change_percent"]:+.2f}%)
+• Min Forecast: ₹{forecast_analysis["min_forecast"]:.2f}
+• Max Forecast: ₹{forecast_analysis["max_forecast"]:.2f}
+• Forecast Range: ₹{forecast_analysis["forecast_range"]:.2f}
+
+📊 CONFIDENCE INTERVALS:
+• Lower Bound: ₹{forecast_analysis["ci_lower_bound"]:.2f}
+• Upper Bound: ₹{forecast_analysis["ci_upper_bound"]:.2f}
+• Band Width: ₹{forecast_analysis["ci_band_width"]:.2f}
+• Relative Band Width: {forecast_analysis["relative_band_width"]:.2f}%
+
+🎯 FORECAST ACCURACY INDICATORS:
+• Standard Error: {performance["standard_error"]:.4f}
+• Mean Absolute Error: {performance["mae"]:.4f}
+• Prediction Quality: {forecast_analysis["prediction_quality"]}
+
+💡 TRADING IMPLICATIONS:"""
+
+            if forecast_analysis["price_change_percent"] > 5:
+                result_text += f"\n🟢 BULLISH FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+            elif forecast_analysis["price_change_percent"] < -5:
+                result_text += f"\n🔴 BEARISH FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+            else:
+                result_text += f"\n🟡 NEUTRAL FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+
+            if forecast_analysis["relative_band_width"] > 0.15:
+                result_text += "\n⚠️ HIGH UNCERTAINTY: Wide confidence bands indicate forecast uncertainty"
+            elif forecast_analysis["relative_band_width"] < 0.05:
+                result_text += "\n✅ HIGH CONFIDENCE: Narrow confidence bands suggest reliable forecast"
+            else:
+                result_text += (
+                    "\n📊 MODERATE CONFIDENCE: Reasonable forecast uncertainty"
+                )
+
+            result_text += f"""
+
+📋 MODEL PERFORMANCE:
+• Training Data Points: {performance["data_points"]}
+ • Model Convergence: {"✅ Converged" if model.mle_retvals is not None else "❌ Non-converged"}
+• Model Quality: {forecast_analysis["model_quality"]}
+
+🔍 RISK CONSIDERATIONS:"""
+
+            if forecast_analysis["price_volatility"] > 0.25:
+                result_text += f"\n• High Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Higher risk expected"
+            elif forecast_analysis["price_volatility"] > 0.15:
+                result_text += f"\n• Moderate Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Normal market conditions"
+            else:
+                result_text += f"\n• Low Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Stable conditions"
+
+            result_text += f"""
+• Forecast Validity: Next {periods} trading days only
+• Market Conditions: Forecast assumes normal market conditions
+• External Events: Not accounted for in statistical forecast
+
+⚙️ RECOMMENDATIONS:
+• Use forecast as one input among multiple analysis methods
+• Monitor actual price movements vs forecast for validation
+• Consider fundamental analysis and market sentiment
+• Set appropriate stop-loss levels based on forecast uncertainty
+• Re-run forecast with new data periodically
+
+📈 FORECAST VISUALIZATION:
+• Historical price data with ARIMA model forecast
+• Confidence bands showing prediction uncertainty
+• Professional time series forecasting chart
+            """.strip()
+
+            return [result_text.strip(), forecast_plot]
+
+        except Exception as e:
+            # Create error visualization
+            error_image = PILImage.new("RGB", (600, 200), color="red")
+            error_content = _encode_image(error_image)
+
+            return [
+                f"❌ ARIMA forecasting failed for {ticker}: {str(e)}",
+                error_content,
+            ]
+
+    except Exception as e:
+        # Create error visualization
+        error_image = PILImage.new("RGB", (600, 200), color="red")
+        error_content = _encode_image(error_image)
+
+        return [
+            f"Error generating ARIMA forecast for {ticker}: {str(e)}",
+            error_content,
+        ]
 
 
 def main():

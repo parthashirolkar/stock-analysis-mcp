@@ -1,0 +1,948 @@
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from .stock_analyzer import normalize_ticker
+import yfinance as yf
+import joblib
+import os
+from datetime import datetime
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+def analyze_acf(series, lags, ticker):
+    """
+    Analyze ACF pattern for key insights.
+
+    Returns:
+        dict: Analysis insights including stationarity, model suggestions, seasonal patterns
+    """
+    from statsmodels.tsa.stattools import acf, adfuller
+
+    # Calculate autocorrelation values
+    autocorr_values = acf(series, nlags=lags, alpha=0.05)
+    acf_values = autocorr_values[0]  # autocorrelation values
+    conf_int = autocorr_values[1]  # confidence intervals
+
+    # Perform ADF test for stationarity
+    try:
+        adf_result = adfuller(series.dropna(), autolag="AIC")
+        adf_statistic = adf_result[0]
+        adf_pvalue = adf_result[1]
+        adf_result[4]
+
+        is_stationary_adf = adf_pvalue < 0.05
+        adf_stationarity = "Stationary" if is_stationary_adf else "Non-stationary"
+    except Exception:
+        adf_statistic = None
+        adf_pvalue = None
+        is_stationary_adf = False
+        adf_stationarity = "Test failed"
+
+    # Significant lags (outside confidence bands)
+    significant_lags = []
+    for i in range(1, len(acf_values)):
+        lower_ci = conf_int[i][0]
+        upper_ci = conf_int[i][1]
+        if acf_values[i] > upper_ci or acf_values[i] < lower_ci:
+            significant_lags.append(i)
+
+    # Determine decay pattern using multiple lags for better assessment
+    lag_1_corr = abs(acf_values[1]) if len(acf_values) > 1 else 0
+    lag_5_corr = abs(acf_values[5]) if len(acf_values) > 5 else 0
+
+    # Calculate decay rate between lags
+    decay_1_to_5 = (
+        (lag_1_corr - lag_5_corr) / lag_1_corr
+        if lag_1_corr > 0 and len(acf_values) > 5
+        else 0
+    )
+
+    if lag_1_corr > 0.8:
+        decay_pattern = "Very Slow (Strong Trend/Non-stationary)"
+        stationarity_indicator = "Non-stationary - needs differencing"
+    elif lag_1_corr > 0.6:
+        decay_pattern = "Slow (Likely Non-stationary)"
+        stationarity_indicator = "Potentially non-stationary"
+    elif lag_1_corr > 0.3:
+        if decay_1_to_5 > 0.7:  # Fast decay after initial
+            decay_pattern = "Moderate to Fast"
+            stationarity_indicator = "Likely Stationary"
+        else:
+            decay_pattern = "Moderate"
+            stationarity_indicator = "Potentially stationary"
+    else:
+        decay_pattern = "Fast (Likely Stationary)"
+        stationarity_indicator = "Stationary"
+
+    # Detect seasonal patterns
+    seasonal_patterns = []
+    for lag in range(7, min(31, len(acf_values))):
+        if acf_values[lag] > 0.3:  # Threshold for seasonal consideration
+            seasonal_patterns.append(lag)
+
+    # MA order suggestion
+    ma_order_suggestion = None
+    if significant_lags:
+        # Find where autocorrelation cuts off (drops below significance)
+        for i in range(1, len(significant_lags) - 1):
+            if significant_lags[i] != significant_lags[i - 1] + 1:
+                ma_order_suggestion = significant_lags[i - 1]
+                break
+        else:
+            ma_order_suggestion = (
+                significant_lags[-1] if len(significant_lags) < 10 else None
+            )
+
+    analysis = {
+        "ticker": ticker,
+        "data_points": len(series),
+        "significant_lags": significant_lags[:10],  # Limit to first 10
+        "lag_1_correlation": round(lag_1_corr, 4),
+        "decay_pattern": decay_pattern,
+        "stationarity_indicator": stationarity_indicator,
+        "seasonal_patterns": seasonal_patterns,
+        "ma_order_suggestion": ma_order_suggestion,
+        "max_autocorr": round(max(abs(acf_values[1:])), 4)
+        if len(acf_values) > 1
+        else 0,
+        # ADF test results
+        "adf_test": {
+            "statistic": round(adf_statistic, 4) if adf_statistic is not None else None,
+            "p_value": round(adf_pvalue, 4) if adf_pvalue is not None else None,
+            "is_stationary": is_stationary_adf,
+            "result": adf_stationarity,
+        },
+        "interpretation": {
+            "trend_strength": "Strong"
+            if lag_1_corr > 0.7
+            else "Moderate"
+            if lag_1_corr > 0.4
+            else "Weak",
+            "forecastability": "High"
+            if lag_1_corr > 0.6
+            else "Moderate"
+            if lag_1_corr > 0.3
+            else "Low",
+            "model_complexity": "High"
+            if len(significant_lags) > 10
+            else "Moderate"
+            if len(significant_lags) > 5
+            else "Low",
+        },
+    }
+
+    return analysis
+
+
+def analyze_pacf(series, lags, ticker):
+    """
+    Analyze PACF pattern for key insights.
+
+    Returns:
+        dict: Analysis insights including AR order suggestions and partial correlation patterns
+    """
+    from statsmodels.tsa.stattools import pacf
+
+    # Adjust lags based on data size (need at least 4x data points for reliable PACF)
+    data_len = len(series)
+    adjusted_lags = min(lags, data_len // 4)  # Maximum 25% of data length
+
+    # Calculate partial autocorrelation values
+    pacf_values = pacf(series, nlags=adjusted_lags, alpha=0.05)
+    pacf_corr = pacf_values[0]  # partial autocorrelation values
+    conf_int = pacf_values[1]  # confidence intervals
+
+    # Significant lags (outside confidence bands)
+    significant_lags = []
+    for i in range(1, len(pacf_corr)):
+        lower_ci = conf_int[i][0]
+        upper_ci = conf_int[i][1]
+        if pacf_corr[i] > upper_ci or pacf_corr[i] < lower_ci:
+            significant_lags.append(i)
+
+    # AR order suggestion (sharp cutoff in PACF suggests AR order)
+    ar_order_suggestion = None
+    if significant_lags:
+        # Find where PACF cuts off (drops below significance)
+        for i in range(1, len(significant_lags) - 1):
+            if significant_lags[i] != significant_lags[i - 1] + 1:
+                ar_order_suggestion = significant_lags[i - 1]
+                break
+        else:
+            ar_order_suggestion = (
+                significant_lags[-1] if len(significant_lags) < 10 else None
+            )
+
+    # Check for immediate spike (lag-1 significance)
+    lag_1_significant = 1 in significant_lags
+    lag_1_partial_corr = pacf_corr[1] if len(pacf_corr) > 1 else 0
+
+    # Determine pattern type
+    if len(significant_lags) <= 2:
+        pattern_type = "Sharp Cutoff (AR signature)"
+    elif len(significant_lags) <= 5:
+        pattern_type = "Moderate Cutoff"
+    else:
+        pattern_type = "Gradual Decay (MA signature)"
+
+    analysis = {
+        "ticker": ticker,
+        "significant_lags": significant_lags[:10],  # Limit to first 10
+        "lag_1_partial_corr": round(lag_1_partial_corr, 4),
+        "lag_1_significant": lag_1_significant,
+        "ar_order_suggestion": ar_order_suggestion,
+        "pattern_type": pattern_type,
+        "max_partial_corr": round(max(abs(pacf_corr[1:])), 4)
+        if len(pacf_corr) > 1
+        else 0,
+        "interpretation": {
+            "ar_suitability": "High"
+            if pattern_type == "Sharp Cutoff (AR signature)"
+            else "Moderate"
+            if pattern_type == "Moderate Cutoff"
+            else "Low",
+            "direct_correlation": "Strong"
+            if lag_1_significant and abs(lag_1_partial_corr) > 0.5
+            else "Moderate"
+            if lag_1_significant
+            else "Weak",
+            "model_simplicity": "Simple"
+            if ar_order_suggestion and ar_order_suggestion <= 3
+            else "Moderate"
+            if ar_order_suggestion and ar_order_suggestion <= 6
+            else "Complex",
+        },
+    }
+
+    return analysis
+
+
+class ARIMATrainer:
+    """
+    Core ARIMA training with intelligent parameter selection
+    """
+
+    def __init__(self, ticker: str, period: str = "1y"):
+        self.ticker = ticker
+        self.period = period
+        self.model = None
+        self.data = None
+        self.analysis_result = None
+
+    def load_data(self):
+        """Load stock data using existing patterns"""
+        period_mapping = {
+            "1D": "1d",
+            "1W": "5d",
+            "1M": "1mo",
+            "3M": "3mo",
+            "6M": "6mo",
+            "1Y": "1y",
+            "2Y": "2y",
+            "5Y": "5y",
+        }
+
+        period = period_mapping.get(self.period.upper(), "1y")
+
+        ticker_variants = normalize_ticker(self.ticker)
+        stock_data = None
+
+        for ticker_symbol in ticker_variants.values():
+            try:
+                downloaded_data = yf.download(
+                    ticker_symbol, period=period, auto_adjust=True
+                )
+                if not downloaded_data.empty:
+                    stock_data = downloaded_data
+                    self.ticker = ticker_symbol
+                    break
+            except Exception:
+                continue
+
+        if stock_data is None or stock_data.empty:
+            raise ValueError(f"No valid stock data found for ticker {self.ticker}")
+
+        self.data = stock_data["Close"].dropna()
+
+        if len(self.data) == 0:
+            raise ValueError(f"No valid closing prices found for ticker {self.ticker}")
+
+    def integrate_acf_pacf_suggestions(self, max_lags=40):
+        """Integrate ACF/PACF analysis for parameter selection"""
+        if self.data is None:
+            self.load_data()
+
+        # Adjust max_lags based on data size (need at least 4x data points for reliable ACF)
+        data_len = len(self.data)
+        adjusted_max_lags = min(max_lags, data_len // 4)  # Maximum 25% of data length
+
+        # Get ACF and PACF analysis
+        acf_analysis = analyze_acf(self.data, adjusted_max_lags, self.ticker)
+        pacf_analysis = analyze_pacf(self.data, adjusted_max_lags, self.ticker)
+
+        return {
+            "acf_suggestion": acf_analysis["ma_order_suggestion"],
+            "pacf_suggestion": pacf_analysis["ar_order_suggestion"],
+            "acf_analysis": acf_analysis,
+            "pacf_analysis": pacf_analysis,
+            "recommended_ar": pacf_analysis["ar_order_suggestion"] or 1,  # Default AR=1
+            "recommended_ma": acf_analysis["ma_order_suggestion"] or 1,  # Default MA=1
+            "stationarity": acf_analysis["adf_test"]["is_stationary"],
+            "trend_strength": acf_analysis["interpretation"]["trend_strength"],
+        }
+
+    def train_model(
+        self,
+        p: int = None,
+        d: int = 1,
+        q: int = None,
+        validation_split: float = 0.2,
+        auto_select: bool = True,
+    ):
+        """
+        Train ARIMA model with parameter validation and intelligent selection
+
+        Args:
+            p: AR order (None for auto-selection)
+            d: Differencing order (default 1 for stock prices)
+            q: MA order (None for auto-selection)
+            validation_split: Train-validation split ratio (default 0.2)
+            auto_select: Use ACF/PACF analysis for parameter selection
+        """
+        if self.data is None:
+            self.load_data()
+
+        # Define max_lags for parameter constraints
+        max_lags = len(self.data) - 2
+
+        # Parameter selection strategy
+        if auto_select:
+            suggestions = self.integrate_acf_pacf_suggestions(
+                max_lags=min(max_lags, len(self.data) - 1)
+            )
+            p = suggestions["recommended_ar"] if p is None else p
+            q = suggestions["recommended_ma"] if q is None else q
+        else:
+            p = p if p is not None else 1
+            q = q if q is not None else 1
+
+        # Validate parameters
+        if p >= len(self.data) or q >= len(self.data) or (p + q) >= max_lags:
+            raise ValueError(f"Parameters (p={p}, q={q}) exceed data constraints")
+
+        try:
+            # Split data for validation
+            split_point = int(len(self.data) * (1 - validation_split))
+            train_data = self.data.iloc[:split_point]
+            test_data = self.data.iloc[split_point:]
+
+            # Train ARIMA model
+            arima_model = ARIMA(train_data, order=(p, d, q))
+            results = arima_model.fit()
+            self.model = results  # Store the fitted results, not the unfitted model
+
+            # Make predictions on validation set
+            # Use in-sample forecasting for the test set
+            # The model was trained on train_data (indices 0 to len(train_data)-1)
+            # We need to predict for the next len(test_data) periods
+            n_periods_to_predict = len(test_data)
+            test_predictions = self.model.get_forecast(
+                steps=n_periods_to_predict
+            ).predicted_mean
+
+            # Calculate performance metrics
+            test_actual = test_data.values
+            test_pred = test_predictions.values
+
+            mse = mean_squared_error(test_actual, test_pred)
+            mae = mean_absolute_error(test_actual, test_pred)
+            mape = np.mean(np.abs((test_actual - test_pred) / test_actual)) * 100
+
+            return {
+                "model": self.model,
+                "parameters": {"p": p, "d": d, "q": q},
+                "performance": {
+                    "mse": mse,
+                    "mae": mae,
+                    "mape": mape,
+                    "train_size": len(train_data),
+                    "test_size": len(test_data),
+                    "validation_split": validation_split,
+                },
+                "aic": results.aic,
+                "bic": results.bic,
+                "log_likelihood": results.llf,
+                "converged": results.mle_retvals is not None,
+                "training_data_points": len(train_data),
+                "test_data_points": len(test_data),
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"ARIMA training failed: {str(e)}")
+
+    def forecast(self, periods: int = 20, confidence_level: float = 0.05):
+        """
+        Generate forecasts with confidence intervals
+
+        Args:
+            periods: Number of periods to forecast
+            confidence_level: Confidence level (default 0.05 for 95% CI)
+        """
+        if self.model is None:
+            raise ValueError("Model not trained. Call train_model() first.")
+
+        try:
+            # Generate forecasts using get_forecast for confidence intervals
+            forecast_result = self.model.get_forecast(steps=periods)
+            forecast_mean = forecast_result.predicted_mean
+            forecast_conf_int = forecast_result.conf_int(alpha=confidence_level)
+
+            # Create forecast dataframe
+            last_date = self.data.index[-1]
+            forecast_dates = pd.date_range(
+                start=last_date + pd.Timedelta(days=1), periods=periods, freq="D"
+            )
+
+            forecasts = []
+            for i in range(periods):
+                if i < len(forecast_mean):
+                    forecasts.append(
+                        {
+                            "date": forecast_dates[i].strftime("%Y-%m-%d"),
+                            "forecast": float(forecast_mean.iloc[i]),
+                            "lower_ci": float(forecast_conf_int.iloc[i, 0]),
+                            "upper_ci": float(forecast_conf_int.iloc[i, 1]),
+                        }
+                    )
+
+            return {
+                "forecasts": forecasts,
+                "confidence_level": 1 - confidence_level,
+                "method": "arima_forecast",
+                "periods": periods,
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"Forecast generation failed: {str(e)}")
+
+    def save_model(self, filepath: str = None):
+        """Save trained model to disk"""
+        if self.model is None:
+            raise ValueError("No model to save")
+
+        if filepath is None:
+            # Generate default filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            filepath = f"models/arima_{self.ticker}_{timestamp}.joblib"
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        # Save model and metadata
+        metadata = {
+            "ticker": self.ticker,
+            "trained_at": datetime.now().isoformat(),
+            "period": self.period,
+            "parameters": self.model.order if hasattr(self.model, "order") else None,
+            "aic": self.model.aic if hasattr(self.model, "aic") else None,
+            "data_points": len(self.data) if self.data is not None else 0,
+        }
+
+        joblib.dump({"model": self.model, "metadata": metadata}, filepath)
+
+        return filepath
+
+    def get_cached_model(self, model_key: str = None):
+        """Get cached model if available and not expired"""
+        if model_key is None:
+            model_key = f"{self.ticker}_{self.period}_default"
+
+        cache_file = f"models/arima_{model_key}.joblib"
+
+        if os.path.exists(cache_file):
+            try:
+                # Check file age (1 hour cache)
+                file_age = datetime.now() - datetime.fromtimestamp(
+                    os.path.getmtime(cache_file)
+                )
+                if file_age.total_seconds() < 3600:  # 1 hour
+                    cached_model = joblib.load(cache_file)
+                    return {
+                        "model": cached_model,
+                        "cached_at": datetime.fromtimestamp(
+                            os.path.getmtime(cache_file)
+                        ),
+                        "cache_file": cache_file,
+                    }
+                else:
+                    # Cache expired, remove it
+                    os.remove(cache_file)
+            except Exception:
+                # Cache corrupted, remove it
+                try:
+                    os.remove(cache_file)
+                except Exception:
+                    pass
+
+        return None
+
+    def forecast_model(self, model, periods: int, confidence: float = 0.95):
+        """Generate forecasts using trained model"""
+        if model is None:
+            raise ValueError("Model not trained. Call train_model() first.")
+
+        try:
+            # Generate forecasts using get_forecast for confidence intervals
+            forecast_result = model.get_forecast(steps=periods)
+            forecast_mean = forecast_result.predicted_mean
+            forecast_conf_int = forecast_result.conf_int(alpha=1 - confidence)
+
+            # Create forecast dataframe
+            last_date = self.data.index[-1]
+            forecast_dates = pd.date_range(
+                start=last_date + pd.Timedelta(days=1), periods=periods, freq="D"
+            )
+
+            forecasts = []
+            for i in range(periods):
+                if i < len(forecast_mean):
+                    forecasts.append(
+                        {
+                            "date": forecast_dates[i].strftime("%Y-%m-%d"),
+                            "forecast": float(forecast_mean.iloc[i]),
+                            "lower_ci": float(forecast_conf_int.iloc[i, 0]),
+                            "upper_ci": float(forecast_conf_int.iloc[i, 1]),
+                        }
+                    )
+
+            # Calculate analysis
+            last_price = float(self.data.values[-1])
+            final_forecast = (
+                float(forecast_mean.iloc[-1]) if len(forecast_mean) > 0 else last_price
+            )
+            price_change = final_forecast - last_price
+            price_change_percent = (
+                (price_change / last_price) * 100 if last_price > 0 else 0
+            )
+
+            forecast_values = [f["forecast"] for f in forecasts]
+            min_forecast = min(forecast_values) if forecast_values else final_forecast
+            max_forecast = max(forecast_values) if forecast_values else final_forecast
+            forecast_range = max_forecast - min_forecast
+
+            ci_lower = (
+                float(forecast_conf_int.iloc[-1, 0])
+                if len(forecast_conf_int) > 0
+                else final_forecast
+            )
+            ci_upper = (
+                float(forecast_conf_int.iloc[-1, 1])
+                if len(forecast_conf_int) > 0
+                else final_forecast
+            )
+            ci_band_width = ci_upper - ci_lower
+            relative_band_width = (
+                (ci_band_width / final_forecast) * 100 if final_forecast > 0 else 0
+            )
+
+            # Calculate volatility from historical data
+            returns = self.data.pct_change().dropna()
+            price_volatility = float(returns.std()) if len(returns) > 0 else 0.1
+
+            return {
+                "forecast_dates": forecast_dates,
+                "forecast_mean": forecast_mean.tolist()
+                if hasattr(forecast_mean, "tolist")
+                else list(forecast_mean),
+                "forecast_ci_lower": [
+                    float(forecast_conf_int.iloc[i, 0])
+                    for i in range(len(forecast_conf_int))
+                ],
+                "forecast_ci_upper": [
+                    float(forecast_conf_int.iloc[i, 1])
+                    for i in range(len(forecast_conf_int))
+                ],
+                "analysis": {
+                    "last_price": last_price,
+                    "final_forecast": final_forecast,
+                    "price_change": price_change,
+                    "price_change_percent": price_change_percent,
+                    "min_forecast": min_forecast,
+                    "max_forecast": max_forecast,
+                    "forecast_range": forecast_range,
+                    "ci_lower_bound": ci_lower,
+                    "ci_upper_bound": ci_upper,
+                    "ci_band_width": ci_band_width,
+                    "relative_band_width": relative_band_width,
+                    "forecast_start_date": forecast_dates[0].strftime("%Y-%m-%d"),
+                    "forecast_end_date": forecast_dates[-1].strftime("%Y-%m-%d"),
+                    "price_volatility": price_volatility,
+                    "prediction_quality": "High"
+                    if relative_band_width < 0.05
+                    else "Medium"
+                    if relative_band_width < 0.15
+                    else "Low",
+                    "model_quality": "Good" if price_volatility < 0.2 else "Fair",
+                },
+                "performance": {
+                    "standard_error": float(np.std([f["forecast"] for f in forecasts])),
+                    "mae": float(
+                        np.mean(
+                            [abs(f["forecast"] - self.data.mean()) for f in forecasts]
+                        )
+                    ),
+                    "data_points": len(self.data),
+                },
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"Forecast generation failed: {str(e)}")
+
+    def comprehensive_diagnostics(self):
+        """Perform comprehensive diagnostic analysis on trained model"""
+        if self.model is None:
+            raise ValueError("Model not trained. Call train_model() first.")
+
+        try:
+            # Get residuals
+            residuals = pd.Series(self.model.resid)
+            dates = self.data.index[-len(residuals) :]
+
+            # Calculate residuals analysis
+            mean_residual = float(residuals.mean())
+            std_residual = float(residuals.std())
+            min_residual = float(residuals.min())
+            max_residual = float(residuals.max())
+            residual_sum = float(residuals.sum())
+
+            # ACF analysis of residuals
+            from statsmodels.tsa.stattools import acf
+
+            acf_result = acf(residuals, nlags=40, alpha=0.05)
+
+            # Handle tuple return when alpha is provided: (acf_values, confint)
+            if isinstance(acf_result, tuple):
+                acf_values_array, confint = acf_result
+                # Convert to list for consistency
+                residual_acf_values = (
+                    acf_values_array.tolist()
+                    if hasattr(acf_values_array, "tolist")
+                    else list(acf_values_array)
+                )
+                # Calculate symmetric confidence interval from confint
+                # confint shape is (nlags+1, 2) with [lower, upper] bounds
+                # For plotting, use a single symmetric confidence band value
+                if confint is not None and len(confint) > 0:
+                    # Use the mean absolute upper bound as the confidence interval
+                    # This gives us a symmetric ±confidence_interval band
+                    confidence_interval = float(np.mean(np.abs(confint[:, 1])))
+                else:
+                    # Fallback: approximate 95% CI using 1.96/sqrt(N)
+                    confidence_interval = 1.96 / np.sqrt(len(residuals))
+            else:
+                # Fallback for older statsmodels versions (shouldn't happen with alpha)
+                residual_acf_values = (
+                    acf_result.tolist()
+                    if hasattr(acf_result, "tolist")
+                    else list(acf_result)
+                )
+                confidence_interval = 1.96 / np.sqrt(len(residuals))
+
+            residual_acf_lags = list(range(len(residual_acf_values)))
+
+            # Normality tests
+            import scipy.stats as stats
+
+            # Shapiro-Wilk test
+            shapiro_stat, shapiro_p = stats.shapiro(residuals)
+
+            # Jarque-Bera test
+            jb_stat, jb_p = stats.jarque_bera(residuals)
+
+            # Ljung-Box test
+            from statsmodels.stats.diagnostic import acorr_ljungbox
+
+            lb_result = acorr_ljungbox(residuals, lags=[10], return_df=True)
+            # acorr_ljungbox returns a DataFrame with 'lb_stat' and 'lb_pvalue' columns when return_df=True
+            if isinstance(lb_result, pd.DataFrame) and len(lb_result) > 0:
+                lb_stat = float(lb_result.iloc[0]["lb_stat"])
+                lb_p = float(lb_result.iloc[0]["lb_pvalue"])
+            else:
+                # Fallback: try without return_df parameter (older versions may return tuple)
+                try:
+                    lb_result_fallback = acorr_ljungbox(residuals, lags=[10])
+                    if isinstance(lb_result_fallback, pd.DataFrame):
+                        lb_stat = float(lb_result_fallback.iloc[0]["lb_stat"])
+                        lb_p = float(lb_result_fallback.iloc[0]["lb_pvalue"])
+                    else:
+                        # If it's a tuple or array-like
+                        lb_stat = (
+                            float(lb_result_fallback[0])
+                            if len(lb_result_fallback) > 0
+                            else 0.0
+                        )
+                        lb_p = (
+                            float(lb_result_fallback[1])
+                            if len(lb_result_fallback) > 1
+                            else 1.0
+                        )
+                except Exception:
+                    # Ultimate fallback
+                    lb_stat = 0.0
+                    lb_p = 1.0
+
+            # Find significant lags
+            significant_lags = []
+            for i, acf_val in enumerate(residual_acf_values):
+                if i > 0 and abs(acf_val) > confidence_interval:
+                    significant_lags.append(i)
+
+            normality_tests = {
+                "Shapiro-Wilk": {
+                    "statistic": shapiro_stat,
+                    "p_value": shapiro_p,
+                    "result": "Normal" if shapiro_p > 0.05 else "Non-normal",
+                },
+                "Jarque-Bera": {
+                    "statistic": jb_stat,
+                    "p_value": jb_p,
+                    "result": "Normal" if jb_p > 0.05 else "Non-normal",
+                },
+            }
+
+            ljung_box_test = {
+                "statistic": lb_stat,
+                "p_value": lb_p,
+                "lags": 10,
+                "result": "White noise" if lb_p > 0.05 else "Not white noise",
+            }
+
+            # Generate recommendations
+            model_improvements = []
+            parameter_suggestions = []
+            warnings = []
+
+            if shapiro_p < 0.05:
+                model_improvements.append("Consider transformation (log, Box-Cox)")
+
+            if lb_p < 0.05:
+                model_improvements.append(
+                    "Residuals show autocorrelation - increase AR/MA orders"
+                )
+
+            if len(significant_lags) > 5:
+                model_improvements.append(
+                    "Too many significant lags - consider differencing"
+                )
+                warnings.append("Complex residual pattern detected")
+
+            recommendations = {
+                "overall_assessment": "Adequate"
+                if shapiro_p > 0.05 and lb_p > 0.05
+                else "Needs improvement",
+                "white_noise_conclusion": "Residuals are white noise"
+                if lb_p > 0.05
+                else "Residuals show correlation",
+                "autocorrelation_conclusion": "No significant autocorrelation"
+                if len(significant_lags) == 0
+                else "Significant autocorrelation present",
+                "normality_conclusion": "Residuals are normally distributed"
+                if shapiro_p > 0.05
+                else "Residuals are not normally distributed",
+                "significant_residual_lags": significant_lags[:5],
+                "model_improvements": model_improvements,
+                "parameter_suggestions": parameter_suggestions,
+                "warnings": warnings,
+                "model_quality": "Good" if shapiro_p > 0.05 and lb_p > 0.05 else "Fair",
+                "forecast_reliability": "High"
+                if len(significant_lags) < 3
+                else "Medium",
+                "complexity_level": "Simple"
+                if len(significant_lags) < 3
+                else "Moderate",
+                "risk_assessment": "Low"
+                if shapiro_p > 0.05 and lb_p > 0.05
+                else "Medium",
+            }
+
+            return {
+                "dates": dates.strftime("%Y-%m-%d").tolist(),
+                "residuals": residuals.tolist(),
+                "residual_acf": {
+                    "lags": residual_acf_lags,
+                    "acf_values": residual_acf_values,
+                    "confidence_interval": confidence_interval,
+                },
+                "diagnostics": {
+                    "mean_residual": mean_residual,
+                    "std_residual": std_residual,
+                    "min_residual": min_residual,
+                    "max_residual": max_residual,
+                    "residual_sum": residual_sum,
+                },
+                "normality_tests": normality_tests,
+                "ljung_box_test": ljung_box_test,
+                "recommendations": recommendations,
+                "data_points": len(self.data),
+                "model_info": {
+                    "p": getattr(self.model, "k_ar", 1),
+                    "d": getattr(self.model, "k_diff", 1),
+                    "q": getattr(self.model, "k_ma", 1),
+                },
+                "date_range": {
+                    "start": dates[0].strftime("%Y-%m-%d"),
+                    "end": dates[-1].strftime("%Y-%m-%d"),
+                },
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"Diagnostic analysis failed: {str(e)}")
+
+
+class SARIMATrainer(ARIMATrainer):
+    """
+    Seasonal ARIMA trainer extending base ARIMA functionality
+    """
+
+    def __init__(self, ticker: str, period: str = "1y", seasonal_period: int = None):
+        super().__init__(ticker, period)
+        self.seasonal_period = seasonal_period
+        self.seasonal_analysis = None
+
+    def detect_seasonal_period(self):
+        """Detect optimal seasonal period using FFT analysis"""
+        if self.data is None:
+            self.load_data()
+
+        # Simple seasonal detection using FFT
+        from scipy.fft import fft
+
+        values = self.data.values
+
+        # Remove trend and compute FFT
+        detrended = values - np.mean(values)
+        fft_values = np.abs(fft(detrended))
+
+        # Find dominant frequencies
+        freqs = np.fft.fftfreq(len(values), 1.0 / 252)  # Trading days
+
+        # Find dominant frequency indices (excluding DC component)
+        top_indices = np.argsort(fft_values)[-10:][::-1][
+            1:
+        ]  # Top 9 frequencies excluding DC
+
+        # Convert frequency indices to periods
+        seasonal_periods = []
+        for idx in top_indices:
+            if freqs[idx] != 0:
+                period = int(1 / abs(freqs[idx]))
+                if 5 <= period <= 252:  # Reasonable range for trading days
+                    seasonal_periods.append(period)
+
+        # Return most common seasonal period
+        if seasonal_periods:
+            return max(set(seasonal_periods), key=seasonal_periods.count)
+        return None
+
+    def train_model(
+        self,
+        p: int = None,
+        d: int = 1,
+        q: int = None,
+        P: int = None,
+        D: int = 1,
+        Q: int = None,
+        validation_split: float = 0.2,
+        auto_select: bool = True,
+    ):
+        """
+        Train SARIMA model with seasonal component
+        """
+        if self.data is None:
+            self.load_data()
+
+        # Auto-detect seasonal period if not provided
+        if self.seasonal_period is None and auto_select:
+            self.seasonal_period = self.detect_seasonal_period()
+
+        # Define max_lags for parameter constraints
+        max_lags = len(self.data) - 2
+
+        # Get base parameter suggestions
+        suggestions = self.integrate_acf_pacf_suggestions(
+            max_lags=min(40, len(self.data) - 1)
+        )
+
+        # Parameter selection
+        if auto_select:
+            p = suggestions["recommended_ar"] if p is None else p
+            q = suggestions["recommended_ma"] if q is None else q
+            P = self.seasonal_period or 4  # Default quarterly
+            D = 1
+            Q = 1
+        else:
+            p = p if p is not None else 1
+            q = q if q is not None else 1
+            P = P if P is not None else 1
+            D = D if D is not None else 1
+            Q = Q if Q is not None else 1
+
+        # Validate parameters for SARIMA
+        seasonal_constraint = max_lags - (P * D + Q)  # Account for seasonal lags
+        if p >= len(self.data) or q >= len(self.data) or seasonal_constraint <= 0:
+            raise ValueError("Parameters exceed data constraints")
+
+        try:
+            # Split data
+            split_point = int(len(self.data) * (1 - validation_split))
+            train_data = self.data.iloc[:split_point]
+            test_data = self.data.iloc[split_point:]
+
+            # Train SARIMA model
+            seasonal_period = self.seasonal_period if self.seasonal_period else 4
+            sarimax_model = SARIMAX(
+                train_data, order=(p, d, q), seasonal_order=(P, D, Q, seasonal_period)
+            )
+            results = sarimax_model.fit()
+            self.model = results  # Store the fitted results, not the unfitted model
+
+            # Validation and performance metrics (similar to ARIMA)
+            # Use in-sample forecasting for the test set
+            n_periods_to_predict = len(test_data)
+            test_predictions = self.model.get_forecast(
+                steps=n_periods_to_predict
+            ).predicted_mean
+            test_actual = test_data.values
+            test_pred = test_predictions.values
+
+            mse = mean_squared_error(test_actual, test_pred)
+            mae = mean_absolute_error(test_actual, test_pred)
+
+            return {
+                "model": self.model,
+                "parameters": {
+                    "p": p,
+                    "d": d,
+                    "q": q,
+                    "P": P,
+                    "D": D,
+                    "Q": Q,
+                    "seasonal_period": self.seasonal_period,
+                },
+                "performance": {
+                    "mse": mse,
+                    "mae": mae,
+                    "train_size": len(train_data),
+                    "test_size": len(test_data),
+                    "validation_split": validation_split,
+                },
+                "aic": results.aic,
+                "bic": results.bic,
+                "log_likelihood": results.llf,
+                "converged": results.mle_retvals is not None,
+                "seasonal_period": self.seasonal_period,
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"SARIMA training failed: {str(e)}")
