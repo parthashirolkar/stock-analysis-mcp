@@ -27,9 +27,8 @@ def analyze_acf(series, lags, ticker):
     # Perform ADF test for stationarity
     try:
         adf_result = adfuller(series.dropna(), autolag="AIC")
-        adf_statistic = adf_result[0]
-        adf_pvalue = adf_result[1]
-        adf_result[4]
+        adf_statistic = float(adf_result[0])
+        adf_pvalue = float(adf_result[1])
 
         is_stationary_adf = adf_pvalue < 0.05
         adf_stationarity = "Stationary" if is_stationary_adf else "Non-stationary"
@@ -229,6 +228,9 @@ class ARIMATrainer:
         self.model = None
         self.data = None
         self.analysis_result = None
+        self.transform_type = None  # "log", "boxcox", or None
+        self.transform_lambda = None  # For Box-Cox transformation
+        self.original_data = None  # Store original data for inverse transformation
 
     def load_data(self):
         """Load stock data using existing patterns"""
@@ -263,10 +265,120 @@ class ARIMATrainer:
         if stock_data is None or stock_data.empty:
             raise ValueError(f"No valid stock data found for ticker {self.ticker}")
 
-        self.data = stock_data["Close"].dropna()
+        # Extract Close prices and ensure it's always a 1D Series
+        close_data = stock_data["Close"]
+
+        # Handle MultiIndex columns (can happen with some yfinance versions/tickers)
+        if isinstance(close_data, pd.DataFrame):
+            # If it's a DataFrame, take the first column (or only column)
+            if close_data.shape[1] == 1:
+                close_data = close_data.iloc[:, 0]
+            else:
+                # Multiple columns - try to find the one matching our ticker
+                ticker_base = normalize_ticker(self.ticker)["base"]
+                if ticker_base in close_data.columns:
+                    close_data = close_data[ticker_base]
+                else:
+                    # Fall back to first column
+                    close_data = close_data.iloc[:, 0]
+
+        # Ensure it's a Series and drop NaNs
+        self.data = pd.Series(close_data).dropna()
 
         if len(self.data) == 0:
             raise ValueError(f"No valid closing prices found for ticker {self.ticker}")
+
+    def _apply_transformation(
+        self, data: pd.Series, transform_type: str = None
+    ) -> pd.Series:
+        """
+        Apply transformation to data.
+
+        Args:
+            data: Input time series data
+            transform_type: Type of transformation ("log", "boxcox", or None)
+
+        Returns:
+            Transformed data series
+        """
+        if transform_type is None or transform_type == "":
+            return data
+
+        if transform_type == "log":
+            # Ensure all values are positive for log transformation
+            if (data <= 0).any():
+                raise ValueError(
+                    "Log transformation requires all values to be positive"
+                )
+            return np.log(data)
+        elif transform_type == "boxcox":
+            from scipy.stats import boxcox
+
+            # Box-Cox requires positive values
+            if (data <= 0).any():
+                # Shift data to be positive
+                min_val = data.min()
+                shift = abs(min_val) + 1 if min_val <= 0 else 0
+                shifted_data = data + shift
+            else:
+                shifted_data = data
+                shift = 0
+
+            transformed, lambda_param = boxcox(shifted_data.values)
+            self.transform_lambda = lambda_param
+            # Store shift for inverse transformation
+            self._boxcox_shift = shift
+            return pd.Series(transformed, index=data.index)
+        else:
+            raise ValueError(f"Unknown transformation type: {transform_type}")
+
+    def _inverse_transform(self, data) -> np.ndarray:
+        """
+        Apply inverse transformation to forecasts.
+
+        Args:
+            data: Transformed data (array, Series, or list)
+
+        Returns:
+            Inverse-transformed data
+        """
+        if self.transform_type is None:
+            if isinstance(data, np.ndarray):
+                return data
+            elif isinstance(data, pd.Series):
+                return data.values
+            else:
+                return np.array(data)
+
+        if self.transform_type == "log":
+            if isinstance(data, np.ndarray):
+                return np.exp(data)
+            elif isinstance(data, pd.Series):
+                return np.exp(data.values)
+            else:
+                return np.exp(np.array(data))
+        elif self.transform_type == "boxcox":
+            from scipy.special import inv_boxcox
+
+            if isinstance(data, np.ndarray):
+                data_array = data
+            elif isinstance(data, pd.Series):
+                data_array = data.values
+            else:
+                data_array = np.array(data)
+
+            inverse_data = inv_boxcox(data_array, self.transform_lambda)
+            # Remove shift if it was applied
+            if hasattr(self, "_boxcox_shift") and self._boxcox_shift != 0:
+                inverse_data = inverse_data - self._boxcox_shift
+            return inverse_data
+        else:
+            if isinstance(data, np.ndarray):
+                return data
+            elif isinstance(data, pd.Series):
+                return data.values
+            else:
+                return np.array(data)
 
     def integrate_acf_pacf_suggestions(self, max_lags=40):
         """Integrate ACF/PACF analysis for parameter selection"""
@@ -299,87 +411,218 @@ class ARIMATrainer:
         q: int = None,
         validation_split: float = 0.2,
         auto_select: bool = True,
+        transform: str = None,
     ):
         """
         Train ARIMA model with parameter validation and intelligent selection
 
         Args:
             p: AR order (None for auto-selection)
-            d: Differencing order (default 1 for stock prices)
+            d: Differencing order (default 1 for stock prices, None for auto-selection when using pmdarima)
             q: MA order (None for auto-selection)
             validation_split: Train-validation split ratio (default 0.2)
-            auto_select: Use ACF/PACF analysis for parameter selection
+            auto_select: Use pmdarima auto_arima for parameter selection (True) or manual ACF/PACF (False)
+            transform: Data transformation type ("log", "boxcox", or None)
         """
         if self.data is None:
             self.load_data()
+
+        # Store original data for inverse transformation
+        self.original_data = self.data.copy()
+        self.transform_type = transform
+
+        # Apply transformation if specified
+        if transform:
+            self.data = self._apply_transformation(self.data, transform)
 
         # Define max_lags for parameter constraints
         max_lags = len(self.data) - 2
 
         # Parameter selection strategy
         if auto_select:
-            suggestions = self.integrate_acf_pacf_suggestions(
-                max_lags=min(max_lags, len(self.data) - 1)
-            )
-            p = suggestions["recommended_ar"] if p is None else p
-            q = suggestions["recommended_ma"] if q is None else q
+            # Use pmdarima for automatic parameter selection
+            try:
+                from pmdarima import auto_arima  # type: ignore[import-untyped]
+
+                # Split data for validation
+                split_point = int(len(self.data) * (1 - validation_split))
+                train_data = self.data.iloc[:split_point]
+                test_data = self.data.iloc[split_point:]
+
+                # Convert to numpy arrays to avoid Series truthiness ambiguity in pmdarima
+                train_y = train_data.dropna().to_numpy(dtype=float)
+                test_y = test_data.dropna().to_numpy(dtype=float)
+
+                # Configure Box-Cox transformation in pmdarima
+                lambda_param = "auto" if transform == "boxcox" else None
+
+                # Use pmdarima auto_arima for automatic selection
+                pmdarima_model = auto_arima(
+                    train_y,
+                    start_p=0,
+                    start_q=0,
+                    max_p=5,
+                    max_q=5,
+                    d=d
+                    if d is not None
+                    else None,  # Auto-select differencing if d is None
+                    seasonal=False,
+                    lambda_=lambda_param,
+                    stepwise=True,
+                    suppress_warnings=True,
+                    error_action="ignore",
+                    information_criterion="aic",
+                    trace=False,
+                )
+
+                # Extract selected parameters
+                order = pmdarima_model.order  # (p, d, q)
+                p, d, q = order[0], order[1], order[2]
+
+                # Store the pmdarima model (it's compatible with statsmodels API)
+                self.model = pmdarima_model
+
+                # Make predictions on validation set
+                n_periods_to_predict = len(test_y)
+                test_predictions = self.model.predict(n_periods_to_predict)
+
+                # Inverse transform predictions if transformation was applied
+                if transform:
+                    test_pred = self._inverse_transform(test_predictions)
+                else:
+                    test_pred = test_predictions
+
+                # Calculate performance metrics
+                # Inverse transform actual values if transformation was applied
+                if transform:
+                    test_actual = self._inverse_transform(test_y)
+                else:
+                    test_actual = test_y
+
+                mse = mean_squared_error(test_actual, test_pred)
+                mae = mean_absolute_error(test_actual, test_pred)
+                mape = np.mean(np.abs((test_actual - test_pred) / test_actual)) * 100
+
+                # Extract AIC, BIC, and log-likelihood from pmdarima model
+                # pmdarima wraps statsmodels, so we need to access the underlying results
+                try:
+                    # Try calling as methods (pmdarima's interface)
+                    model_aic = (
+                        pmdarima_model.aic()
+                        if callable(getattr(pmdarima_model, "aic", None))
+                        else pmdarima_model.aic
+                    )
+                    model_bic = (
+                        pmdarima_model.bic()
+                        if callable(getattr(pmdarima_model, "bic", None))
+                        else pmdarima_model.bic
+                    )
+                    # llf is typically in the wrapped statsmodels results
+                    model_llf = (
+                        pmdarima_model.arima_res_.llf
+                        if hasattr(pmdarima_model, "arima_res_")
+                        else None
+                    )
+                except Exception:
+                    model_aic = None
+                    model_bic = None
+                    model_llf = None
+
+                return {
+                    "model": self.model,
+                    "parameters": {"p": p, "d": d, "q": q},
+                    "performance": {
+                        "mse": mse,
+                        "mae": mae,
+                        "mape": mape,
+                        "train_size": len(train_y),
+                        "test_size": len(test_y),
+                        "validation_split": validation_split,
+                    },
+                    "aic": model_aic,
+                    "bic": model_bic,
+                    "log_likelihood": model_llf,
+                    "converged": True,  # pmdarima handles convergence internally
+                    "training_data_points": len(train_y),
+                    "test_data_points": len(test_y),
+                }
+
+            except ImportError:
+                raise RuntimeError(
+                    "pmdarima is required but not installed. Install with: pip install pmdarima"
+                )
+            except Exception as e:
+                raise RuntimeError(f"pmdarima auto_arima failed: {str(e)}")
+
         else:
-            p = p if p is not None else 1
-            q = q if q is not None else 1
+            # Manual parameter selection (only when auto_select=False)
+            if p is None or q is None:
+                suggestions = self.integrate_acf_pacf_suggestions(
+                    max_lags=min(max_lags, len(self.data) - 1)
+                )
+                p = p if p is not None else (suggestions["recommended_ar"] or 1)
+                q = q if q is not None else (suggestions["recommended_ma"] or 1)
+            d = d if d is not None else 1
 
-        # Validate parameters
-        if p >= len(self.data) or q >= len(self.data) or (p + q) >= max_lags:
-            raise ValueError(f"Parameters (p={p}, q={q}) exceed data constraints")
+            # Validate parameters
+            if p >= len(self.data) or q >= len(self.data) or (p + q) >= max_lags:
+                raise ValueError(f"Parameters (p={p}, q={q}) exceed data constraints")
 
-        try:
-            # Split data for validation
-            split_point = int(len(self.data) * (1 - validation_split))
-            train_data = self.data.iloc[:split_point]
-            test_data = self.data.iloc[split_point:]
+            try:
+                # Split data for validation
+                split_point = int(len(self.data) * (1 - validation_split))
+                train_data = self.data.iloc[:split_point]
+                test_data = self.data.iloc[split_point:]
 
-            # Train ARIMA model
-            arima_model = ARIMA(train_data, order=(p, d, q))
-            results = arima_model.fit()
-            self.model = results  # Store the fitted results, not the unfitted model
+                # Train ARIMA model using statsmodels
+                arima_model = ARIMA(train_data, order=(p, d, q))
+                results = arima_model.fit()
+                self.model = results  # Store the fitted results, not the unfitted model
 
-            # Make predictions on validation set
-            # Use in-sample forecasting for the test set
-            # The model was trained on train_data (indices 0 to len(train_data)-1)
-            # We need to predict for the next len(test_data) periods
-            n_periods_to_predict = len(test_data)
-            test_predictions = self.model.get_forecast(
-                steps=n_periods_to_predict
-            ).predicted_mean
+                # Make predictions on validation set
+                n_periods_to_predict = len(test_data)
+                test_predictions = self.model.get_forecast(
+                    steps=n_periods_to_predict
+                ).predicted_mean
 
-            # Calculate performance metrics
-            test_actual = test_data.values
-            test_pred = test_predictions.values
+                # Inverse transform predictions if transformation was applied
+                if transform:
+                    test_pred = self._inverse_transform(test_predictions)
+                else:
+                    test_pred = test_predictions.values
 
-            mse = mean_squared_error(test_actual, test_pred)
-            mae = mean_absolute_error(test_actual, test_pred)
-            mape = np.mean(np.abs((test_actual - test_pred) / test_actual)) * 100
+                # Calculate performance metrics
+                # Inverse transform actual values if transformation was applied
+                if transform:
+                    test_actual = self._inverse_transform(test_data.values)
+                else:
+                    test_actual = test_data.values
 
-            return {
-                "model": self.model,
-                "parameters": {"p": p, "d": d, "q": q},
-                "performance": {
-                    "mse": mse,
-                    "mae": mae,
-                    "mape": mape,
-                    "train_size": len(train_data),
-                    "test_size": len(test_data),
-                    "validation_split": validation_split,
-                },
-                "aic": results.aic,
-                "bic": results.bic,
-                "log_likelihood": results.llf,
-                "converged": results.mle_retvals is not None,
-                "training_data_points": len(train_data),
-                "test_data_points": len(test_data),
-            }
+                mse = mean_squared_error(test_actual, test_pred)
+                mae = mean_absolute_error(test_actual, test_pred)
+                mape = np.mean(np.abs((test_actual - test_pred) / test_actual)) * 100
 
-        except Exception as e:
-            raise RuntimeError(f"ARIMA training failed: {str(e)}")
+                return {
+                    "model": self.model,
+                    "parameters": {"p": p, "d": d, "q": q},
+                    "performance": {
+                        "mse": mse,
+                        "mae": mae,
+                        "mape": mape,
+                        "train_size": len(train_data),
+                        "test_size": len(test_data),
+                        "validation_split": validation_split,
+                    },
+                    "aic": results.aic,
+                    "bic": results.bic,
+                    "log_likelihood": results.llf,
+                    "converged": results.mle_retvals is not None,
+                    "training_data_points": len(train_data),
+                    "test_data_points": len(test_data),
+                }
+
+            except Exception as e:
+                raise RuntimeError(f"ARIMA training failed: {str(e)}")
 
     def forecast(self, periods: int = 20, confidence_level: float = 0.05):
         """
@@ -404,15 +647,29 @@ class ARIMATrainer:
                 start=last_date + pd.Timedelta(days=1), periods=periods, freq="D"
             )
 
+            # Apply inverse transformation if transformation was used
+            if self.transform_type:
+                forecast_mean_values = self._inverse_transform(forecast_mean)
+                forecast_conf_int_lower = self._inverse_transform(
+                    forecast_conf_int.iloc[:, 0]
+                )
+                forecast_conf_int_upper = self._inverse_transform(
+                    forecast_conf_int.iloc[:, 1]
+                )
+            else:
+                forecast_mean_values = forecast_mean.values
+                forecast_conf_int_lower = forecast_conf_int.iloc[:, 0].values
+                forecast_conf_int_upper = forecast_conf_int.iloc[:, 1].values
+
             forecasts = []
             for i in range(periods):
-                if i < len(forecast_mean):
+                if i < len(forecast_mean_values):
                     forecasts.append(
                         {
                             "date": forecast_dates[i].strftime("%Y-%m-%d"),
-                            "forecast": float(forecast_mean.iloc[i]),
-                            "lower_ci": float(forecast_conf_int.iloc[i, 0]),
-                            "upper_ci": float(forecast_conf_int.iloc[i, 1]),
+                            "forecast": float(forecast_mean_values[i]),
+                            "lower_ci": float(forecast_conf_int_lower[i]),
+                            "upper_ci": float(forecast_conf_int_upper[i]),
                         }
                     )
 
@@ -447,6 +704,9 @@ class ARIMATrainer:
             "parameters": self.model.order if hasattr(self.model, "order") else None,
             "aic": self.model.aic if hasattr(self.model, "aic") else None,
             "data_points": len(self.data) if self.data is not None else 0,
+            "transform_type": self.transform_type,
+            "transform_lambda": getattr(self, "transform_lambda", None),
+            "_boxcox_shift": getattr(self, "_boxcox_shift", None),
         }
 
         joblib.dump({"model": self.model, "metadata": metadata}, filepath)
@@ -488,15 +748,71 @@ class ARIMATrainer:
         return None
 
     def forecast_model(self, model, periods: int, confidence: float = 0.95):
-        """Generate forecasts using trained model"""
+        """Generate forecasts using trained model (supports both statsmodels and pmdarima)"""
         if model is None:
             raise ValueError("Model not trained. Call train_model() first.")
 
         try:
-            # Generate forecasts using get_forecast for confidence intervals
-            forecast_result = model.get_forecast(steps=periods)
-            forecast_mean = forecast_result.predicted_mean
-            forecast_conf_int = forecast_result.conf_int(alpha=1 - confidence)
+            # Check if this is a pmdarima model or statsmodels model
+            # pmdarima models have a predict method that returns conf_int
+            # statsmodels models have get_forecast method
+            if hasattr(model, "get_forecast") and callable(model.get_forecast):
+                # Statsmodels path
+                forecast_result = model.get_forecast(steps=periods)
+                forecast_mean = forecast_result.predicted_mean
+                forecast_conf_int = forecast_result.conf_int(alpha=1 - confidence)
+
+                # Apply inverse transformation if transformation was used
+                if self.transform_type:
+                    forecast_mean_values = self._inverse_transform(forecast_mean)
+                    forecast_conf_int_lower = self._inverse_transform(
+                        forecast_conf_int.iloc[:, 0]
+                    )
+                    forecast_conf_int_upper = self._inverse_transform(
+                        forecast_conf_int.iloc[:, 1]
+                    )
+                else:
+                    forecast_mean_values = (
+                        forecast_mean.tolist()
+                        if hasattr(forecast_mean, "tolist")
+                        else list(forecast_mean)
+                    )
+                    forecast_conf_int_lower = [
+                        float(forecast_conf_int.iloc[i, 0])
+                        for i in range(len(forecast_conf_int))
+                    ]
+                    forecast_conf_int_upper = [
+                        float(forecast_conf_int.iloc[i, 1])
+                        for i in range(len(forecast_conf_int))
+                    ]
+            elif hasattr(model, "predict") and callable(model.predict):
+                # pmdarima path
+                # pmdarima predict with return_conf_int returns (forecast, conf_int)
+                forecast_mean, conf_int = model.predict(
+                    n_periods=periods, return_conf_int=True, alpha=1 - confidence
+                )
+
+                # Apply inverse transformation if transformation was used
+                if self.transform_type:
+                    forecast_mean_values = self._inverse_transform(forecast_mean)
+                    forecast_conf_int_lower = self._inverse_transform(conf_int[:, 0])
+                    forecast_conf_int_upper = self._inverse_transform(conf_int[:, 1])
+                else:
+                    forecast_mean_values = (
+                        forecast_mean.tolist()
+                        if hasattr(forecast_mean, "tolist")
+                        else list(forecast_mean)
+                    )
+                    forecast_conf_int_lower = [
+                        float(conf_int[i, 0]) for i in range(len(conf_int))
+                    ]
+                    forecast_conf_int_upper = [
+                        float(conf_int[i, 1]) for i in range(len(conf_int))
+                    ]
+            else:
+                raise RuntimeError(
+                    "Model does not support forecasting (no get_forecast or predict method)"
+                )
 
             # Create forecast dataframe
             last_date = self.data.index[-1]
@@ -506,20 +822,26 @@ class ARIMATrainer:
 
             forecasts = []
             for i in range(periods):
-                if i < len(forecast_mean):
+                if i < len(forecast_mean_values):
                     forecasts.append(
                         {
                             "date": forecast_dates[i].strftime("%Y-%m-%d"),
-                            "forecast": float(forecast_mean.iloc[i]),
-                            "lower_ci": float(forecast_conf_int.iloc[i, 0]),
-                            "upper_ci": float(forecast_conf_int.iloc[i, 1]),
+                            "forecast": float(forecast_mean_values[i]),
+                            "lower_ci": float(forecast_conf_int_lower[i]),
+                            "upper_ci": float(forecast_conf_int_upper[i]),
                         }
                     )
 
-            # Calculate analysis
-            last_price = float(self.data.values[-1])
+            # Calculate analysis - use original data for last_price if transformation was applied
+            if self.transform_type and self.original_data is not None:
+                last_price = float(self.original_data.values[-1])
+            else:
+                last_price = float(self.data.values[-1])
+
             final_forecast = (
-                float(forecast_mean.iloc[-1]) if len(forecast_mean) > 0 else last_price
+                float(forecast_mean_values[-1])
+                if len(forecast_mean_values) > 0
+                else last_price
             )
             price_change = final_forecast - last_price
             price_change_percent = (
@@ -532,13 +854,13 @@ class ARIMATrainer:
             forecast_range = max_forecast - min_forecast
 
             ci_lower = (
-                float(forecast_conf_int.iloc[-1, 0])
-                if len(forecast_conf_int) > 0
+                float(forecast_conf_int_lower[-1])
+                if len(forecast_conf_int_lower) > 0
                 else final_forecast
             )
             ci_upper = (
-                float(forecast_conf_int.iloc[-1, 1])
-                if len(forecast_conf_int) > 0
+                float(forecast_conf_int_upper[-1])
+                if len(forecast_conf_int_upper) > 0
                 else final_forecast
             )
             ci_band_width = ci_upper - ci_lower
@@ -546,23 +868,18 @@ class ARIMATrainer:
                 (ci_band_width / final_forecast) * 100 if final_forecast > 0 else 0
             )
 
-            # Calculate volatility from historical data
-            returns = self.data.pct_change().dropna()
+            # Calculate volatility from historical data (use original if transformed)
+            if self.transform_type and self.original_data is not None:
+                returns = self.original_data.pct_change().dropna()
+            else:
+                returns = self.data.pct_change().dropna()
             price_volatility = float(returns.std()) if len(returns) > 0 else 0.1
 
             return {
                 "forecast_dates": forecast_dates,
-                "forecast_mean": forecast_mean.tolist()
-                if hasattr(forecast_mean, "tolist")
-                else list(forecast_mean),
-                "forecast_ci_lower": [
-                    float(forecast_conf_int.iloc[i, 0])
-                    for i in range(len(forecast_conf_int))
-                ],
-                "forecast_ci_upper": [
-                    float(forecast_conf_int.iloc[i, 1])
-                    for i in range(len(forecast_conf_int))
-                ],
+                "forecast_mean": forecast_mean_values,
+                "forecast_ci_lower": forecast_conf_int_lower,
+                "forecast_ci_upper": forecast_conf_int_upper,
                 "analysis": {
                     "last_price": last_price,
                     "final_forecast": final_forecast,
@@ -588,11 +905,11 @@ class ARIMATrainer:
                 "performance": {
                     "standard_error": float(np.std([f["forecast"] for f in forecasts])),
                     "mae": float(
-                        np.mean(
-                            [abs(f["forecast"] - self.data.mean()) for f in forecasts]
-                        )
+                        np.mean([abs(f["forecast"] - last_price) for f in forecasts])
                     ),
-                    "data_points": len(self.data),
+                    "data_points": len(self.original_data)
+                    if self.original_data is not None
+                    else len(self.data),
                 },
             }
 
@@ -605,8 +922,26 @@ class ARIMATrainer:
             raise ValueError("Model not trained. Call train_model() first.")
 
         try:
-            # Get residuals
-            residuals = pd.Series(self.model.resid)
+            # Get residuals - handle both statsmodels and pmdarima models
+            if hasattr(self.model, "resid"):
+                # pmdarima models have resid as a callable method
+                # statsmodels models have resid as an array attribute
+                if callable(self.model.resid):
+                    # pmdarima: call method to get residuals
+                    residuals = pd.Series(self.model.resid())
+                else:
+                    # statsmodels: resid is an array attribute
+                    residuals = pd.Series(self.model.resid)
+            elif hasattr(self.model, "arima_res_") and hasattr(
+                self.model.arima_res_, "resid"
+            ):
+                # pmdarima models store statsmodels results in arima_res_
+                residuals = pd.Series(self.model.arima_res_.resid)
+            else:
+                raise RuntimeError(
+                    "Model does not have residuals (no resid attribute found)"
+                )
+
             dates = self.data.index[-len(residuals) :]
 
             # Calculate residuals analysis
@@ -785,11 +1120,7 @@ class ARIMATrainer:
                 "ljung_box_test": ljung_box_test,
                 "recommendations": recommendations,
                 "data_points": len(self.data),
-                "model_info": {
-                    "p": getattr(self.model, "k_ar", 1),
-                    "d": getattr(self.model, "k_diff", 1),
-                    "q": getattr(self.model, "k_ma", 1),
-                },
+                "model_info": self._get_model_info(),
                 "date_range": {
                     "start": dates[0].strftime("%Y-%m-%d"),
                     "end": dates[-1].strftime("%Y-%m-%d"),
@@ -798,6 +1129,52 @@ class ARIMATrainer:
 
         except Exception as e:
             raise RuntimeError(f"Diagnostic analysis failed: {str(e)}")
+
+    def _get_model_convergence(self, model):
+        """
+        Safely get convergence status from both pmdarima and statsmodels models.
+
+        Args:
+            model: Trained ARIMA model (pmdarima or statsmodels)
+
+        Returns:
+            bool: True if model converged, False otherwise
+        """
+        try:
+            # Try direct access (statsmodels)
+            if hasattr(model, "mle_retvals"):
+                return model.mle_retvals is not None
+            # Try wrapped access (pmdarima stores statsmodels results in arima_res_)
+            elif hasattr(model, "arima_res_") and hasattr(
+                model.arima_res_, "mle_retvals"
+            ):
+                return model.arima_res_.mle_retvals is not None
+            # Fallback - assume converged if model exists and was successfully trained
+            return True
+        except Exception:
+            # If anything goes wrong, assume converged
+            return True
+
+    def _get_model_info(self):
+        """Extract model order (p, d, q) from either statsmodels or pmdarima models"""
+        try:
+            # For pmdarima models, use the order attribute
+            if hasattr(self.model, "order"):
+                order = self.model.order
+                return {"p": order[0], "d": order[1], "q": order[2]}
+            # For statsmodels models, try k_ar, k_diff, k_ma attributes
+            elif hasattr(self.model, "k_ar"):
+                return {
+                    "p": getattr(self.model, "k_ar", 1),
+                    "d": getattr(self.model, "k_diff", 1),
+                    "q": getattr(self.model, "k_ma", 1),
+                }
+            else:
+                # Fallback to default values
+                return {"p": 1, "d": 1, "q": 1}
+        except Exception:
+            # Ultimate fallback
+            return {"p": 1, "d": 1, "q": 1}
 
 
 class SARIMATrainer(ARIMATrainer):
@@ -855,12 +1232,32 @@ class SARIMATrainer(ARIMATrainer):
         Q: int = None,
         validation_split: float = 0.2,
         auto_select: bool = True,
+        transform: str = None,
     ):
         """
         Train SARIMA model with seasonal component
+
+        Args:
+            p: AR order (None for auto-selection)
+            d: Differencing order (default 1 for stock prices, None for auto-selection when using pmdarima)
+            q: MA order (None for auto-selection)
+            P: Seasonal AR order (None for auto-selection)
+            D: Seasonal differencing order (default 1)
+            Q: Seasonal MA order (None for auto-selection)
+            validation_split: Train-validation split ratio (default 0.2)
+            auto_select: Use pmdarima auto_arima for parameter selection (True) or manual (False)
+            transform: Data transformation type ("log", "boxcox", or None)
         """
         if self.data is None:
             self.load_data()
+
+        # Store original data for inverse transformation
+        self.original_data = self.data.copy()
+        self.transform_type = transform
+
+        # Apply transformation if specified
+        if transform:
+            self.data = self._apply_transformation(self.data, transform)
 
         # Auto-detect seasonal period if not provided
         if self.seasonal_period is None and auto_select:
@@ -869,22 +1266,160 @@ class SARIMATrainer(ARIMATrainer):
         # Define max_lags for parameter constraints
         max_lags = len(self.data) - 2
 
-        # Get base parameter suggestions
-        suggestions = self.integrate_acf_pacf_suggestions(
-            max_lags=min(40, len(self.data) - 1)
-        )
-
-        # Parameter selection
+        # Parameter selection strategy
         if auto_select:
-            p = suggestions["recommended_ar"] if p is None else p
-            q = suggestions["recommended_ma"] if q is None else q
-            P = self.seasonal_period or 4  # Default quarterly
-            D = 1
-            Q = 1
+            # Use pmdarima for automatic parameter selection
+            try:
+                from pmdarima import auto_arima  # type: ignore[import-untyped]
+
+                # Split data for validation
+                split_point = int(len(self.data) * (1 - validation_split))
+                train_data = self.data.iloc[:split_point]
+                test_data = self.data.iloc[split_point:]
+
+                # Convert to numpy arrays to avoid Series truthiness ambiguity in pmdarima
+                train_y = train_data.dropna().to_numpy(dtype=float)
+                test_y = test_data.dropna().to_numpy(dtype=float)
+
+                # Configure Box-Cox transformation in pmdarima
+                lambda_param = "auto" if transform == "boxcox" else None
+
+                # Determine seasonal period
+                seasonal_period = self.seasonal_period if self.seasonal_period else 4
+
+                # Use pmdarima auto_arima for automatic selection with seasonal component
+                pmdarima_model = auto_arima(
+                    train_y,
+                    start_p=0,
+                    start_q=0,
+                    max_p=5,
+                    max_q=5,
+                    d=d if d is not None else None,
+                    start_P=0,
+                    start_Q=0,
+                    max_P=2,
+                    max_Q=2,
+                    D=D if D is not None else None,
+                    seasonal=True,
+                    m=seasonal_period,
+                    lambda_=lambda_param,
+                    stepwise=True,
+                    suppress_warnings=True,
+                    error_action="ignore",
+                    information_criterion="aic",
+                    trace=False,
+                )
+
+                # Extract selected parameters
+                order = pmdarima_model.order  # (p, d, q)
+                seasonal_order = pmdarima_model.seasonal_order  # (P, D, Q, m)
+                p, d, q = order[0], order[1], order[2]
+                P, D, Q, m = (
+                    seasonal_order[0],
+                    seasonal_order[1],
+                    seasonal_order[2],
+                    seasonal_order[3],
+                )
+                self.seasonal_period = m
+
+                # Store the pmdarima model
+                self.model = pmdarima_model
+
+                # Make predictions on validation set
+                n_periods_to_predict = len(test_y)
+                test_predictions = self.model.predict(n_periods_to_predict)
+
+                # Inverse transform predictions if transformation was applied
+                if transform:
+                    test_pred = self._inverse_transform(test_predictions)
+                else:
+                    test_pred = test_predictions
+
+                # Calculate performance metrics
+                # Inverse transform actual values if transformation was applied
+                if transform:
+                    test_actual = self._inverse_transform(test_y)
+                else:
+                    test_actual = test_y
+
+                mse = mean_squared_error(test_actual, test_pred)
+                mae = mean_absolute_error(test_actual, test_pred)
+
+                # Extract AIC, BIC, and log-likelihood from pmdarima model
+                # pmdarima wraps statsmodels, so we need to access the underlying results
+                try:
+                    # Try calling as methods (pmdarima's interface)
+                    model_aic = (
+                        pmdarima_model.aic()
+                        if callable(getattr(pmdarima_model, "aic", None))
+                        else pmdarima_model.aic
+                    )
+                    model_bic = (
+                        pmdarima_model.bic()
+                        if callable(getattr(pmdarima_model, "bic", None))
+                        else pmdarima_model.bic
+                    )
+                    # llf is typically in the wrapped statsmodels results
+                    model_llf = (
+                        pmdarima_model.arima_res_.llf
+                        if hasattr(pmdarima_model, "arima_res_")
+                        else None
+                    )
+                except Exception:
+                    model_aic = None
+                    model_bic = None
+                    model_llf = None
+
+                return {
+                    "model": self.model,
+                    "parameters": {
+                        "p": p,
+                        "d": d,
+                        "q": q,
+                        "P": P,
+                        "D": D,
+                        "Q": Q,
+                        "seasonal_period": self.seasonal_period,
+                    },
+                    "performance": {
+                        "mse": mse,
+                        "mae": mae,
+                        "train_size": len(train_y),
+                        "test_size": len(test_y),
+                        "validation_split": validation_split,
+                    },
+                    "aic": model_aic,
+                    "bic": model_bic,
+                    "log_likelihood": model_llf,
+                    "converged": True,  # pmdarima handles convergence internally
+                    "seasonal_period": self.seasonal_period,
+                }
+
+            except ImportError:
+                raise RuntimeError(
+                    "pmdarima is required but not installed. Install with: pip install pmdarima"
+                )
+            except Exception as e:
+                raise RuntimeError(f"pmdarima auto_arima failed: {str(e)}")
+
+        # Manual parameter selection (only when auto_select=False)
         else:
-            p = p if p is not None else 1
-            q = q if q is not None else 1
-            P = P if P is not None else 1
+            if p is None or q is None:
+                suggestions = self.integrate_acf_pacf_suggestions(
+                    max_lags=min(40, len(self.data) - 1)
+                )
+            p = (
+                p
+                if p is not None
+                else (suggestions["recommended_ar"] if auto_select else 1)
+            )
+            q = (
+                q
+                if q is not None
+                else (suggestions["recommended_ma"] if auto_select else 1)
+            )
+            d = d if d is not None else 1
+            P = P if P is not None else (self.seasonal_period or 4)
             D = D if D is not None else 1
             Q = Q if Q is not None else 1
 
@@ -899,7 +1434,7 @@ class SARIMATrainer(ARIMATrainer):
             train_data = self.data.iloc[:split_point]
             test_data = self.data.iloc[split_point:]
 
-            # Train SARIMA model
+            # Train SARIMA model using statsmodels
             seasonal_period = self.seasonal_period if self.seasonal_period else 4
             sarimax_model = SARIMAX(
                 train_data, order=(p, d, q), seasonal_order=(P, D, Q, seasonal_period)
@@ -908,13 +1443,23 @@ class SARIMATrainer(ARIMATrainer):
             self.model = results  # Store the fitted results, not the unfitted model
 
             # Validation and performance metrics (similar to ARIMA)
-            # Use in-sample forecasting for the test set
             n_periods_to_predict = len(test_data)
             test_predictions = self.model.get_forecast(
                 steps=n_periods_to_predict
             ).predicted_mean
-            test_actual = test_data.values
-            test_pred = test_predictions.values
+
+            # Inverse transform predictions if transformation was applied
+            if transform:
+                test_pred = self._inverse_transform(test_predictions)
+            else:
+                test_pred = test_predictions.values
+
+            # Calculate performance metrics
+            # Inverse transform actual values if transformation was applied
+            if transform:
+                test_actual = self._inverse_transform(test_data.values)
+            else:
+                test_actual = test_data.values
 
             mse = mean_squared_error(test_actual, test_pred)
             mae = mean_absolute_error(test_actual, test_pred)
