@@ -172,34 +172,7 @@ Search for banking stocks
 Find companies with "tata" in the name
 ```
 
-### 5. `historical_data`
-Get historical price data for technical analysis.
-
-**Parameters:**
-- `ticker` (required): Indian stock ticker symbol
-- `period` (optional): Time period - 1D, 1W, 1M, 3M, 6M, 1Y, 2Y, 5Y (default: "1M")
-
-**Example Usage:**
-```
-Show me historical data for Reliance over the past 3 months
-Get 1 year of price data for TCS
-```
-
-**Sample Output:**
-```
-Historical Data for RELIANCE (3M):
-
-Date       | Open    | High    | Low     | Close   | Volume
-2024-01-15 | 2,815.00 | 2,855.90 | 2,812.00 | 2,845.50 | 15,234,567
-2024-01-12 | 2,798.20 | 2,820.00 | 2,795.50 | 2,811.70 | 12,456,789
-...
-
-Period Performance: +5.2% (₹142.30)
-Period High: ₹2,855.90
-Period Low: ₹2,650.20
-```
-
-### 6. `market_overview`
+### 5. `market_overview`
 Get current Indian market indices and sector performance.
 
 **Example Usage:**
@@ -239,17 +212,17 @@ List of frequently analyzed Indian stocks with basic information.
 
 ### Portfolio Analysis Workflow
 ```
-User: "Show me the fundamentals of Reliance Industries"
+User: "Show me fundamentals of Reliance Industries"
 [Uses company_fundamentals tool]
 
-User: "What's the current market status?"
+User: "What's current market status?"
 [Uses market_overview tool]
 
 User: "Get recent news about Reliance"
 [Uses stock_news tool]
 
-User: "How has Reliance performed over the past 6 months?"
-[Uses historical_data tool]
+User: "How has Reliance performed technically over the past 6 months?"
+[Uses technical_analysis tool]
 ```
 
 ### Stock Discovery Workflow
@@ -272,8 +245,8 @@ User: "What's today's market overview?"
 User: "Find banking stocks with good fundamentals"
 [Uses search_indian_stocks tool + company_fundamentals tool]
 
-User: "Show me historical data for top performers"
-[Uses historical_data tool]
+User: "Show me technical analysis for top performers"
+[Uses technical_analysis tool]
 ```
 
 ## Development
