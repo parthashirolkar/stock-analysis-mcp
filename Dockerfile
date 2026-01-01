@@ -24,14 +24,15 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application code
-COPY --chown=mcp:mcp server.py stock_analyzer.py ./
+COPY --chown=mcp:mcp server.py ./
+COPY --chown=mcp:mcp src/ ./src/
 
 # Switch to non-root user
 USER mcp
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app:/app/src
 ENV LOG_LEVEL=ERROR
 
 
