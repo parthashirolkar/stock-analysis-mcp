@@ -611,13 +611,14 @@ async def train_arima_model(
     auto_select: bool = True,
     lags: int = 40,
     period: str = "1y",
+    transform: str = None,
 ) -> list:
     """
-    Train ARIMA model with intelligent parameter selection using existing ACF/PACF analysis.
+    Train ARIMA model with intelligent parameter selection using pmdarima auto_arima.
 
     Provides:
-    - Model training with automated ARIMA order selection
-    - Intelligent parameter suggestions from ACF/PACF analysis
+    - Model training with automated ARIMA order selection via pmdarima
+    - Data transformation support (log, Box-Cox) for improved normality
     - Performance metrics and validation on holdout set
     - Model persistence with caching capability
     - Error handling and graceful fallbacks
@@ -628,9 +629,10 @@ async def train_arima_model(
         d: Differencing order (default 1 for stock prices)
         q: MA order (None for auto-selection)
         validation_split: Train-validation split ratio (default 0.2)
-        auto_select: Use ACF/PACF analysis for parameter selection
-        lags: Number of lags for analysis (default 40)
+        auto_select: Use pmdarima auto_arima for parameter selection (True) or manual (False)
+        lags: Number of lags for analysis (default 40, used for fallback ACF/PACF)
         period: Time period for training data ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+        transform: Data transformation type ("log", "boxcox", or None for no transformation)
 
     Returns:
         List containing text analysis and ImageContent with training plot
@@ -648,6 +650,7 @@ async def train_arima_model(
             q=q if not auto_select else None,
             validation_split=validation_split,
             auto_select=auto_select,
+            transform=transform,
         )
 
         try:
@@ -655,10 +658,15 @@ async def train_arima_model(
             buf = io.BytesIO()
             plt.figure(figsize=(14, 8))
 
-            # Get train/test split for visualization
-            split_point = int(len(trainer.data) * (1 - validation_split))
-            train_data_plot = trainer.data.iloc[:split_point]
-            test_data_plot = trainer.data.iloc[split_point:]
+            # Get train/test split for visualization - use original scale if transformation was applied
+            if transform:
+                data_source = trainer.original_data
+            else:
+                data_source = trainer.data
+
+            split_point = int(len(data_source) * (1 - validation_split))
+            train_data_plot = data_source.iloc[:split_point]
+            test_data_plot = data_source.iloc[split_point:]
 
             # Plot training data
             plt.plot(
@@ -669,10 +677,28 @@ async def train_arima_model(
                 color="blue",
             )
 
-            # Plot ARIMA fit (only for training period)
+            # Plot ARIMA fit (only for training period) - inverse-transform if needed
+            model = result["model"]
+            if transform:
+                # Inverse transform fittedvalues to original scale
+                if callable(model.fittedvalues):
+                    fitted_vals = model.fittedvalues()
+                else:
+                    fitted_vals = model.fittedvalues
+                # Trim to match train_data_plot length
+                fitted_vals = fitted_vals[: len(train_data_plot)]
+                model_fitted = trainer._inverse_transform(fitted_vals)
+            else:
+                if callable(model.fittedvalues):
+                    model_fitted = model.fittedvalues()
+                else:
+                    model_fitted = model.fittedvalues
+                # Trim to match train_data_plot length
+                model_fitted = model_fitted[: len(train_data_plot)]
+
             plt.plot(
                 train_data_plot.index,
-                result["model"].fittedvalues,
+                model_fitted,
                 label="ARIMA Fit",
                 alpha=0.9,
                 linewidth=2,
@@ -866,7 +892,9 @@ Market Cap: ₹{data["market_cap"]:,}
 
 
 @mcp.tool()
-async def arima_model_diagnostics(ticker: str, period: str = "1y") -> list:
+async def arima_model_diagnostics(
+    ticker: str, period: str = "1y", transform: str = None
+) -> list:
     """
     Perform comprehensive diagnostics on trained ARIMA model.
 
@@ -880,6 +908,7 @@ async def arima_model_diagnostics(ticker: str, period: str = "1y") -> list:
     Args:
         ticker: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
         period: Time period for analysis ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+        transform: Data transformation type ("log", "boxcox", or None for no transformation)
 
     Returns:
         List containing text analysis and ImageContent with diagnostic plots
@@ -893,7 +922,12 @@ async def arima_model_diagnostics(ticker: str, period: str = "1y") -> list:
         # Train model first before diagnostics
         try:
             trainer.train_model(
-                p=None, d=1, q=None, validation_split=0.8, auto_select=True
+                p=None,
+                d=1,
+                q=None,
+                validation_split=0.8,
+                auto_select=True,
+                transform=transform,
             )
         except Exception as e:
             # Create error visualization
@@ -1100,6 +1134,7 @@ async def forecast_arima_model(
     auto_select: bool = True,
     lags: int = 40,
     period: str = "1y",
+    transform: str = None,
 ) -> list:
     """
     Generate ARIMA model forecasts with confidence intervals and validation.
@@ -1118,9 +1153,10 @@ async def forecast_arima_model(
         p: AR order (None for auto-selection)
         d: Differencing order (default 1 for stock prices)
         q: MA order (None for auto-selection)
-        auto_select: Use ACF/PACF analysis for parameter selection
-        lags: Number of lags for analysis (default 40)
+        auto_select: Use pmdarima auto_arima for parameter selection (True) or manual (False)
+        lags: Number of lags for analysis (default 40, used for fallback ACF/PACF)
         period: Time period for training data ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+        transform: Data transformation type ("log", "boxcox", or None for no transformation)
 
     Returns:
         List containing text analysis and ImageContent with forecast plot
@@ -1140,25 +1176,23 @@ async def forecast_arima_model(
         trainer = ARIMATrainer(ticker, period)
 
         # Check if model exists in cache
-        model_key = f"{ticker}_{period}_{p}_{d}_{q}"
+        model_key = f"{ticker}_{period}_{p}_{d}_{q}_{transform or 'none'}"
         cached_model = trainer.get_cached_model(model_key)
 
         if not cached_model:
-            # Parameter selection strategy
-            if auto_select:
-                suggestions = trainer.integrate_acf_pacf_suggestions(max_lags=lags)
-                p = suggestions["recommended_ar"] or 1
-                q = suggestions["recommended_ma"] or 1
-            # else: use provided p and q values (already have defaults of 1)
-
-            # Validate parameters
-            max_lags = len(trainer.data) - 2
-            if p >= len(trainer.data) or q >= len(trainer.data) or (p + q) >= max_lags:
-                raise ValueError(f"Parameters (p={p}, q={q}) exceed data constraints")
-
-            # Train model
-            train_result = trainer.train_model(p, d, q, validation_split=0.8)
+            # Train model with auto_select and transform parameters
+            train_result = trainer.train_model(
+                p=p if not auto_select else None,
+                d=d,
+                q=q if not auto_select else None,
+                validation_split=0.8,
+                auto_select=auto_select,
+                transform=transform,
+            )
             model = train_result["model"]
+            # Update model_key with actual trained parameters
+            actual_params = train_result["parameters"]
+            model_key = f"{ticker}_{period}_{actual_params['p']}_{actual_params['d']}_{actual_params['q']}_{transform or 'none'}"
         else:
             model = cached_model["model"]
 
@@ -1170,10 +1204,15 @@ async def forecast_arima_model(
             buf = io.BytesIO()
             plt.figure(figsize=(14, 8))
 
-            # Historical data
+            # Historical data - use original scale if transformation was applied
+            if transform:
+                historical_data = trainer.original_data
+            else:
+                historical_data = trainer.data
+
             plt.plot(
-                trainer.data.index[-60:],
-                trainer.data.values[-60:],
+                historical_data.index[-60:],
+                historical_data.values[-60:],
                 label="Historical Data",
                 alpha=0.7,
                 linewidth=2,
@@ -1209,8 +1248,8 @@ async def forecast_arima_model(
                 label=f"{int(confidence * 100)}% Confidence Band",
             )
 
-            # Last known price line
-            last_price = float(trainer.data.iloc[-1])
+            # Last known price line - use original scale if transformation was applied
+            last_price = float(trainer.original_data.iloc[-1])
             plt.axhline(
                 y=last_price,
                 color="green",
@@ -1288,10 +1327,10 @@ async def forecast_arima_model(
 
             result_text += f"""
 
-📋 MODEL PERFORMANCE:
-• Training Data Points: {performance["data_points"]}
- • Model Convergence: {"✅ Converged" if model.mle_retvals is not None else "❌ Non-converged"}
-• Model Quality: {forecast_analysis["model_quality"]}
+ 📋 MODEL PERFORMANCE:
+ • Training Data Points: {performance["data_points"]}
+  • Model Convergence: {"✅ Converged" if trainer._get_model_convergence(model) else "❌ Non-converged"}
+ • Model Quality: {forecast_analysis["model_quality"]}
 
 🔍 RISK CONSIDERATIONS:"""
 
