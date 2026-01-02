@@ -1382,6 +1382,311 @@ async def forecast_arima_model(
         ]
 
 
+@mcp.tool()
+async def forecast_prophet_model(
+    ticker: str,
+    periods: int = 20,
+    confidence: float = 0.95,
+    period: str = "1y",
+    yearly_seasonality: bool = True,
+    weekly_seasonality: bool = True,
+    seasonality_mode: str = "additive",
+    changepoint_prior_scale: float = 0.05,
+    seasonality_prior_scale: float = 10.0,
+    holidays_prior_scale: float = 10.0,
+    validation_split: float = 0.2,
+    include_holidays: bool = False,
+) -> list:
+    """
+    Train Prophet model and generate forecasts with confidence intervals.
+
+    Provides:
+    - Automatic seasonality detection (yearly, weekly patterns)
+    - Trend changepoint identification
+    - Holiday effects support (Indian market holidays)
+    - Component decomposition (trend + seasonality)
+    - Multi-period forecasting with confidence bands
+    - Model validation and quality checks
+    - Visual forecast charts with historical data
+
+    Args:
+        ticker: Stock ticker symbol (e.g., 'RELIANCE', 'TCS', 'INFY')
+        periods: Number of periods to forecast (default: 20 trading days)
+        confidence: Confidence interval level (0.8-0.99, default: 0.95)
+        period: Time period for training data ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+        yearly_seasonality: Enable yearly seasonality (default True)
+        weekly_seasonality: Enable weekly seasonality (default True)
+        seasonality_mode: 'additive' or 'multiplicative' (default 'additive')
+        changepoint_prior_scale: Flexibility of trend changes (default 0.05)
+        seasonality_prior_scale: Flexibility of seasonality (default 10.0)
+        holidays_prior_scale: Flexibility of holiday effects (default 10.0)
+        validation_split: Train-validation split ratio (default 0.2)
+        include_holidays: Include Indian market holidays (default False)
+
+    Returns:
+        List containing text analysis and ImageContent with forecast plot
+    """
+    try:
+        from src.model_training import ProphetTrainer
+
+        if periods < 1 or periods > 252:
+            raise ValueError(f"Periods must be between 1 and 252, got {periods}")
+        if not 0.8 <= confidence <= 0.99:
+            raise ValueError(
+                f"Confidence must be between 0.8 and 0.99, got {confidence}"
+            )
+
+        trainer = ProphetTrainer(ticker, period)
+
+        train_result = trainer.train_model(
+            yearly_seasonality=yearly_seasonality,
+            weekly_seasonality=weekly_seasonality,
+            daily_seasonality=False,
+            seasonality_mode=seasonality_mode,
+            changepoint_prior_scale=changepoint_prior_scale,
+            seasonality_prior_scale=seasonality_prior_scale,
+            holidays_prior_scale=holidays_prior_scale,
+            holidays=None,
+            validation_split=validation_split,
+            include_holidays=include_holidays,
+            confidence=confidence,
+        )
+
+        model = train_result["model"]
+        train_forecast = train_result["train_forecast"]
+
+        forecast_result = trainer.forecast(periods, model=model)
+
+        try:
+            buf = io.BytesIO()
+            plt.figure(figsize=(14, 8))
+
+            split_point = int(len(trainer.original_data) * (1 - validation_split))
+            train_data_plot = trainer.original_data.iloc[:split_point]
+            test_data_plot = trainer.original_data.iloc[split_point:]
+
+            # Plot training data
+            plt.plot(
+                train_data_plot.index,
+                train_data_plot.values,
+                label="Training Data",
+                alpha=0.7,
+                linewidth=2,
+                color="blue",
+            )
+
+            # Plot Prophet fit (aligned by date in train_forecast)
+            if len(train_forecast) > 0:
+                plt.plot(
+                    train_forecast["ds"],
+                    train_forecast["yhat"],
+                    label="Prophet Fit (Training)",
+                    alpha=0.9,
+                    linewidth=2,
+                    color="orange",
+                )
+
+            # Plot test data
+            plt.plot(
+                test_data_plot.index,
+                test_data_plot.values,
+                label="Test Data",
+                alpha=0.7,
+                color="green",
+                linestyle="--",
+            )
+
+            forecast_dates = forecast_result["forecast_dates"]
+            forecast_mean = forecast_result["forecast_mean"]
+            forecast_ci_lower = forecast_result["forecast_ci_lower"]
+            forecast_ci_upper = forecast_result["forecast_ci_upper"]
+
+            # Convert DatetimeIndex to NumPy array for matplotlib compatibility
+            forecast_dates_array = forecast_dates.to_numpy()
+
+            forecast_mean_list = (
+                forecast_mean.tolist()
+                if hasattr(forecast_mean, "tolist")
+                else list(forecast_mean)
+            )
+
+            plt.plot(
+                forecast_dates_array,
+                forecast_mean_list,
+                label="Forecast",
+                color="red",
+                linewidth=2,
+                marker="o",
+            )
+            plt.fill_between(
+                forecast_dates_array,
+                forecast_ci_lower,
+                forecast_ci_upper,
+                alpha=0.3,
+                color="red",
+                label=f"{int(confidence * 100)}% Confidence Band",
+            )
+
+            last_price = float(trainer.original_data.iloc[-1])
+            plt.axhline(
+                y=last_price,
+                color="green",
+                linestyle="--",
+                alpha=0.7,
+                label=f"Last Price: ₹{last_price:.2f}",
+            )
+
+            plt.title(f"Prophet Forecast - {ticker.upper()} ({periods} trading days)")
+            plt.xlabel("Date")
+            plt.ylabel("Price (₹)")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            img_bytes = buf.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode()
+            forecast_plot = ImageContent(
+                type="image", data=img_base64, mimeType="image/png"
+            )
+            buf.close()
+            plt.close()
+
+            forecast_analysis = forecast_result["analysis"]
+            performance = forecast_result["performance"]
+            parameters = train_result["parameters"]
+
+            result_text = f"""🔮 PROPHET FORECAST - {ticker.upper()}
+
+📊 MODEL PARAMETERS:
+• Yearly Seasonality: {"Enabled" if parameters["yearly_seasonality"] else "Disabled"}
+• Weekly Seasonality: {"Enabled" if parameters["weekly_seasonality"] else "Disabled"}
+• Seasonality Mode: {parameters["seasonality_mode"].title()}
+• Changepoint Prior Scale: {parameters["changepoint_prior_scale"]}
+• Seasonality Prior Scale: {parameters["seasonality_prior_scale"]}
+• Indian Holidays: {"Included" if parameters["include_holidays"] else "Excluded"}
+
+📊 TRAINING SUMMARY:
+• Training Data Points: {train_result["train_data_points"]}
+• Validation Data Points: {train_result["test_data_points"]}
+• Training Split: {(1 - validation_split) * 100:.0f}% train / {validation_split * 100:.0f}% test
+
+📈 VALIDATION METRICS:
+• Mean Squared Error (MSE): {train_result["performance"]["mse"]:.6f}
+• Mean Absolute Error (MAE): {train_result["performance"]["mae"]:.4f}
+• Mean Absolute Percentage Error (MAPE): {train_result["performance"]["mape"]:.2f}%
+
+📊 FORECAST SUMMARY:
+• Ticker: {ticker}
+• Forecast Periods: {periods} trading days
+• Confidence Level: {confidence * 100:.0f}%
+• Last Price: ₹{forecast_analysis["last_price"]:.2f}
+• Forecast Horizon: {forecast_analysis["forecast_start_date"]} to {forecast_analysis["forecast_end_date"]}
+
+📈 FORECAST RESULTS:
+• Final Forecast: ₹{forecast_analysis["final_forecast"]:.2f}
+• Price Change: {forecast_analysis["price_change"]:+.2f} ({forecast_analysis["price_change_percent"]:+.2f}%)
+• Min Forecast: ₹{forecast_analysis["min_forecast"]:.2f}
+• Max Forecast: ₹{forecast_analysis["max_forecast"]:.2f}
+• Forecast Range: ₹{forecast_analysis["forecast_range"]:.2f}
+
+📊 CONFIDENCE INTERVALS:
+• Lower Bound: ₹{forecast_analysis["ci_lower_bound"]:.2f}
+• Upper Bound: ₹{forecast_analysis["ci_upper_bound"]:.2f}
+• Band Width: ₹{forecast_analysis["ci_band_width"]:.2f}
+• Relative Band Width: {forecast_analysis["relative_band_width"]:.2f}%
+
+🎯 FORECAST ACCURACY INDICATORS:
+• Standard Error: {performance["standard_error"]:.4f}
+• Mean Absolute Error: {performance["mae"]:.4f}
+• Prediction Quality: {forecast_analysis["prediction_quality"]}
+
+💡 TRADING IMPLICATIONS:"""
+
+            if forecast_analysis["price_change_percent"] > 5:
+                result_text += f"\n🟢 BULLISH FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+            elif forecast_analysis["price_change_percent"] < -5:
+                result_text += f"\n🔴 BEARISH FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+            else:
+                result_text += f"\n🟡 NEUTRAL FORECAST: Expected {forecast_analysis['price_change_percent']:+.2f}% movement"
+
+            if forecast_analysis["relative_band_width"] > 0.15:
+                result_text += "\n⚠️ HIGH UNCERTAINTY: Wide confidence bands indicate forecast uncertainty"
+            elif forecast_analysis["relative_band_width"] < 0.05:
+                result_text += "\n✅ HIGH CONFIDENCE: Narrow confidence bands suggest reliable forecast"
+            else:
+                result_text += (
+                    "\n📊 MODERATE CONFIDENCE: Reasonable forecast uncertainty"
+                )
+
+            result_text += f"""
+
+📋 MODEL PERFORMANCE:
+• Training Data Points: {performance["data_points"]}
+• Model Quality: {forecast_analysis["model_quality"]}
+
+🔍 RISK CONSIDERATIONS:"""
+
+            if forecast_analysis["price_volatility"] > 0.25:
+                result_text += f"\n• High Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Higher risk expected"
+            elif forecast_analysis["price_volatility"] > 0.15:
+                result_text += f"\n• Moderate Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Normal market conditions"
+            else:
+                result_text += f"\n• Low Volatility (σ={forecast_analysis['price_volatility']:.1%}) - Stable conditions"
+
+            result_text += f"""
+• Forecast Validity: Next {periods} trading days only
+• Market Conditions: Forecast assumes normal market conditions
+• External Events: Not accounted for in statistical forecast
+
+⚙️ RECOMMENDATIONS:
+• Use forecast as one input among multiple analysis methods
+• Monitor actual price movements vs forecast for validation
+• Consider fundamental analysis and market sentiment
+• Set appropriate stop-loss levels based on forecast uncertainty
+• Re-run forecast with new data periodically
+
+🤖 PROPHET ADVANTAGES:
+• Automatic seasonality detection (no manual parameter tuning)
+• Changepoint detection identifies trend changes
+• Handles missing data gracefully
+• Component decomposition (trend + seasonality)
+• Holiday effects support for market events
+• More interpretable than ARIMA/SARIMA
+
+📈 FORECAST VISUALIZATION:
+• Historical training data (blue)
+• Prophet in-sample fit (orange)
+• Test validation data (green dashed)
+• Prophet forecast (red with dots)
+• Confidence bands showing prediction uncertainty
+• Last price reference line (green dashed)
+• Professional time series forecasting chart
+            """.strip()
+
+            return [result_text.strip(), forecast_plot]
+
+        except Exception as e:
+            error_image = PILImage.new("RGB", (600, 200), color="red")
+            error_content = _encode_image(error_image)
+
+            return [
+                f"❌ Prophet forecasting failed for {ticker}: {str(e)}",
+                error_content,
+            ]
+
+    except Exception as e:
+        error_image = PILImage.new("RGB", (600, 200), color="red")
+        error_content = _encode_image(error_image)
+
+        return [
+            f"Error generating Prophet forecast for {ticker}: {str(e)}",
+            error_content,
+        ]
+
+
 def main():
     """Initialize and run the server"""
     mcp.run(transport="stdio")

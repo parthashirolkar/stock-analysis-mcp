@@ -1491,3 +1491,307 @@ class SARIMATrainer(ARIMATrainer):
 
         except Exception as e:
             raise RuntimeError(f"SARIMA training failed: {str(e)}")
+
+
+class ProphetTrainer:
+    """
+    Facebook Prophet model trainer for stock price forecasting
+
+    Uses Prophet's automatic seasonality detection and changepoint identification
+    for flexible and interpretable time series forecasting.
+    """
+
+    def __init__(self, ticker: str, period: str = "1y"):
+        self.ticker = ticker
+        self.period = period
+        self.model = None
+        self.data = None
+        self.original_data = None
+
+    def load_data(self) -> None:
+        """Load stock data using yfinance"""
+        period_mapping = {
+            "1D": "1d",
+            "1W": "5d",
+            "1M": "1mo",
+            "3M": "3mo",
+            "6M": "6mo",
+            "1Y": "1y",
+            "2Y": "2y",
+            "5Y": "5y",
+        }
+
+        period = period_mapping.get(self.period.upper(), "1y")
+
+        ticker_variants = normalize_ticker(self.ticker)
+        stock_data = None
+
+        for ticker_symbol in ticker_variants.values():
+            try:
+                downloaded_data = yf.download(
+                    ticker_symbol, period=period, auto_adjust=True
+                )
+                if not downloaded_data.empty:
+                    stock_data = downloaded_data
+                    self.ticker = ticker_symbol
+                    break
+            except Exception:
+                continue
+
+        if stock_data is None or stock_data.empty:
+            raise ValueError(f"No valid stock data found for ticker {self.ticker}")
+
+        close_data = stock_data["Close"]
+
+        if isinstance(close_data, pd.DataFrame):
+            if close_data.shape[1] == 1:
+                close_data = close_data.iloc[:, 0]
+            else:
+                ticker_base = normalize_ticker(self.ticker)["base"]
+                if ticker_base in close_data.columns:
+                    close_data = close_data[ticker_base]
+                else:
+                    close_data = close_data.iloc[:, 0]
+
+        self.data = pd.Series(close_data).dropna()
+        self.original_data = self.data.copy()
+
+        if len(self.data) == 0:
+            raise ValueError(f"No valid closing prices found for ticker {self.ticker}")
+
+    def train_model(
+        self,
+        yearly_seasonality: bool = True,
+        weekly_seasonality: bool = True,
+        daily_seasonality: bool = False,
+        seasonality_mode: str = "additive",
+        changepoint_prior_scale: float = 0.05,
+        seasonality_prior_scale: float = 10.0,
+        holidays_prior_scale: float = 10.0,
+        holidays: pd.DataFrame = None,
+        validation_split: float = 0.2,
+        include_holidays: bool = False,
+        confidence: float = 0.95,
+    ) -> dict:
+        """
+        Train Prophet model with configurable parameters.
+
+        Args:
+            yearly_seasonality: Enable yearly seasonality (default True)
+            weekly_seasonality: Enable weekly seasonality (default True)
+            daily_seasonality: Enable daily seasonality (default False)
+            seasonality_mode: 'additive' or 'multiplicative' (default 'additive')
+            changepoint_prior_scale: Flexibility of trend changes (default 0.05)
+            seasonality_prior_scale: Flexibility of seasonality (default 10.0)
+            holidays_prior_scale: Flexibility of holiday effects (default 10.0)
+            holidays: Custom holidays DataFrame (optional)
+            validation_split: Train-validation split ratio (default 0.2)
+            include_holidays: Include Indian market holidays (default False)
+            confidence: Confidence interval level (0.8-0.99, default 0.95)
+
+        Returns:
+            dict with model, parameters, performance metrics
+        """
+        if self.data is None:
+            self.load_data()
+
+        try:
+            from prophet import Prophet
+
+            split_point = int(len(self.data) * (1 - validation_split))
+            train_data = self.data.iloc[:split_point]
+            test_data = self.data.iloc[split_point:]
+
+            # Normalize datetime index to midnight (no timezone) for Prophet
+            train_df = pd.DataFrame({
+                "ds": pd.to_datetime(train_data.index).normalize(),
+                "y": train_data.values
+            })
+
+            model = Prophet(
+                yearly_seasonality=yearly_seasonality,
+                weekly_seasonality=weekly_seasonality,
+                daily_seasonality=daily_seasonality,
+                seasonality_mode=seasonality_mode,
+                changepoint_prior_scale=changepoint_prior_scale,
+                seasonality_prior_scale=seasonality_prior_scale,
+                holidays_prior_scale=holidays_prior_scale,
+                holidays=holidays,
+                interval_width=confidence,
+            )
+
+            if include_holidays:
+                model.add_country_holidays(country_name="IN")
+
+            model.fit(train_df)
+
+            # Store trained model
+            self.model = model
+
+            # Use business-day frequency for predictions
+            future = model.make_future_dataframe(
+                periods=len(test_data), freq="B", include_history=True
+            )
+            forecast = model.predict(future)
+
+            # Normalize both datetime indices for proper alignment
+            forecast["ds"] = pd.to_datetime(forecast["ds"]).dt.normalize()
+            test_data_normalized = test_data.copy()
+            test_data_normalized.index = pd.to_datetime(test_data.index).normalize()
+            train_data_normalized = train_data.copy()
+            train_data_normalized.index = pd.to_datetime(train_data.index).normalize()
+
+            # Join forecast to test data by date (proper alignment, no isin filtering)
+            test_forecast_df = forecast.merge(
+                pd.DataFrame({"ds": test_data_normalized.index, "actual": test_data_normalized.values}),
+                on="ds",
+                how="inner"
+            )
+
+            # Only compute metrics where we have both prediction and actual
+            if len(test_forecast_df) > 0:
+                test_predictions = test_forecast_df["yhat"].values
+                test_actual = test_forecast_df["actual"].values
+
+                mse = mean_squared_error(test_actual, test_predictions)
+                mae = mean_absolute_error(test_actual, test_predictions)
+                mape = np.mean(np.abs((test_actual - test_predictions) / test_actual)) * 100
+            else:
+                # Fallback if no alignment (shouldn't happen with freq="B")
+                mse = mae = mape = float('nan')
+
+            # Extract train forecast for plotting (aligned by date)
+            train_forecast_df = forecast.merge(
+                pd.DataFrame({"ds": train_data_normalized.index}),
+                on="ds",
+                how="inner"
+            )
+
+            return {
+                "model": model,
+                "train_df": train_df,
+                "test_data": test_data,
+                "train_forecast": train_forecast_df,
+                "test_forecast": test_forecast_df,
+                "parameters": {
+                    "yearly_seasonality": yearly_seasonality,
+                    "weekly_seasonality": weekly_seasonality,
+                    "daily_seasonality": daily_seasonality,
+                    "seasonality_mode": seasonality_mode,
+                    "changepoint_prior_scale": changepoint_prior_scale,
+                    "seasonality_prior_scale": seasonality_prior_scale,
+                    "holidays_prior_scale": holidays_prior_scale,
+                    "include_holidays": include_holidays,
+                    "confidence": confidence,
+                },
+                "performance": {
+                    "mse": mse,
+                    "mae": mae,
+                    "mape": mape,
+                    "train_size": len(train_data),
+                    "test_size": len(test_data),
+                    "validation_split": validation_split,
+                    "matched_test_points": len(test_forecast_df),
+                },
+                "train_data_points": len(train_data),
+                "test_data_points": len(test_data),
+            }
+
+        except ImportError:
+            raise RuntimeError(
+                "Prophet is required but not installed. Install with: uv add prophet"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Prophet training failed: {str(e)}")
+
+    def forecast(
+        self,
+        periods: int,
+        model=None,
+    ) -> dict:
+        """
+        Generate Prophet forecasts with confidence intervals.
+
+        Args:
+            periods: Number of trading day periods to forecast
+            model: Trained Prophet model (optional, uses self.model if not provided)
+
+        Returns:
+            dict with forecast data and analysis
+        """
+        if self.model is None and model is None:
+            raise ValueError("Model not trained. Call train_model() first.")
+
+        try:
+            if model is None:
+                model = self.model
+
+            # Use business-day frequency for forecast
+            future = model.make_future_dataframe(periods=periods, freq="B")
+            forecast = model.predict(future)
+
+            # Get only the future forecast (last N periods)
+            forecast_filtered = forecast.iloc[-periods:]
+
+            forecast_dates = pd.to_datetime(forecast_filtered["ds"])
+            forecast_mean = forecast_filtered["yhat"].values
+            forecast_lower = forecast_filtered["yhat_lower"].values
+            forecast_upper = forecast_filtered["yhat_upper"].values
+
+            last_price = float(self.original_data.values[-1])
+            final_forecast = float(forecast_mean[-1])
+            price_change = final_forecast - last_price
+            price_change_percent = (
+                (price_change / last_price) * 100 if last_price > 0 else 0
+            )
+
+            min_forecast = float(np.min(forecast_mean))
+            max_forecast = float(np.max(forecast_mean))
+            forecast_range = max_forecast - min_forecast
+
+            ci_lower = float(forecast_lower[-1])
+            ci_upper = float(forecast_upper[-1])
+            ci_band_width = ci_upper - ci_lower
+            relative_band_width = (
+                (ci_band_width / final_forecast) * 100 if final_forecast > 0 else 0
+            )
+
+            returns = self.original_data.pct_change().dropna()
+            price_volatility = float(returns.std()) if len(returns) > 0 else 0.1
+
+            return {
+                "forecast_dates": forecast_dates,
+                "forecast_mean": forecast_mean,
+                "forecast_ci_lower": forecast_lower,
+                "forecast_ci_upper": forecast_upper,
+                "analysis": {
+                    "last_price": last_price,
+                    "final_forecast": final_forecast,
+                    "price_change": price_change,
+                    "price_change_percent": price_change_percent,
+                    "min_forecast": min_forecast,
+                    "max_forecast": max_forecast,
+                    "forecast_range": forecast_range,
+                    "ci_lower_bound": ci_lower,
+                    "ci_upper_bound": ci_upper,
+                    "ci_band_width": ci_band_width,
+                    "relative_band_width": relative_band_width,
+                    "forecast_start_date": forecast_dates.iloc[0].strftime("%Y-%m-%d"),
+                    "forecast_end_date": forecast_dates.iloc[-1].strftime("%Y-%m-%d"),
+                    "price_volatility": price_volatility,
+                    "prediction_quality": "High"
+                    if relative_band_width < 0.05
+                    else "Medium"
+                    if relative_band_width < 0.15
+                    else "Low",
+                    "model_quality": "Good" if price_volatility < 0.2 else "Fair",
+                },
+                "performance": {
+                    "standard_error": float(np.std(forecast_mean)),
+                    "mae": float(np.mean([abs(f - last_price) for f in forecast_mean])),
+                    "data_points": len(self.original_data),
+                },
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"Prophet forecast generation failed: {str(e)}")

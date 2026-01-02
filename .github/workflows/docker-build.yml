@@ -3,22 +3,8 @@ name: Docker Build and Push
 on:
   push:
     branches: [main, develop]
-    paths:
-      - 'Dockerfile'
-      - 'docker-compose.yml'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - 'server.py'
-      - 'src/**'
   pull_request:
     branches: [main]
-    paths:
-      - 'Dockerfile'
-      - 'docker-compose.yml'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - 'server.py'
-      - 'src/**'
 
 jobs:
   build:
